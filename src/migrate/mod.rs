@@ -148,21 +148,17 @@ pub fn run_with_path(
         .iter()
         .filter(|c| c.severity == Severity::Medium)
         .count();
-    let total_low = found
-        .iter()
-        .filter(|c| c.severity == Severity::Low)
-        .count();
+    let total_low = found.iter().filter(|c| c.severity == Severity::Low).count();
 
     let mut migrated_count = 0;
 
     if !dry_run {
         if let Some(vault) = vault {
             for cred in &found {
-                // We only have the preview, not the full value.
-                // In a real implementation, we'd read the full value from the source.
-                // For now, we store a marker — the user should re-set via CLI.
-                // This is safe because scan_content doesn't store full values.
-                let _ = vault.set(&cred.name, "[MIGRATED — set real value via: wardn vault set]");
+                // cred.value carries the actual scanned value (never
+                // serialized — see FoundCredential — so it doesn't leak
+                // into the dry-run report/JSON export, only into the vault).
+                let _ = vault.set(&cred.name, &cred.value);
                 migrated_count += 1;
             }
         }
@@ -227,6 +223,22 @@ mod tests {
     }
 
     #[test]
+    fn test_migration_stores_the_real_scanned_value_not_a_marker() {
+        let dir = setup_test_dir();
+        let mut vault = Vault::ephemeral();
+        let source = MigrateSource::Directory(dir.path().to_path_buf());
+
+        run_with_path(&source, dir.path(), Some(&mut vault), false).unwrap();
+
+        let openai = vault.get("OPENAI_KEY").unwrap().expose();
+        assert_eq!(openai, "sk-proj-abc123def456ghi789");
+        assert!(!openai.contains("MIGRATED"));
+
+        let anthropic = vault.get("ANTHROPIC_KEY").unwrap().expose();
+        assert_eq!(anthropic, "sk-ant-xyz789abc123def456");
+    }
+
+    #[test]
     fn test_risk_score() {
         let dir = setup_test_dir();
         let source = MigrateSource::Directory(dir.path().to_path_buf());
@@ -268,6 +280,23 @@ mod tests {
         let json = serde_json::to_string_pretty(&report).unwrap();
         assert!(json.contains("credentials_found"));
         assert!(json.contains("total_critical"));
+    }
+
+    #[test]
+    fn test_report_json_export_never_contains_real_scanned_values() {
+        // FoundCredential.value carries the real value so migrate can store
+        // it — it must never leak into the report/JSON, even though the
+        // dry-run report DOES include the redacted value_preview.
+        let dir = setup_test_dir();
+        let source = MigrateSource::Directory(dir.path().to_path_buf());
+        let report = run_with_path(&source, dir.path(), None, true).unwrap();
+
+        let json = serde_json::to_string_pretty(&report).unwrap();
+        assert!(!json.contains("sk-proj-abc123def456ghi789"));
+        assert!(!json.contains("sk-ant-xyz789abc123def456"));
+        assert!(!json.contains("ghp_1234567890abcdef1234567890abcdef12345678"));
+        // The redacted preview form is still present.
+        assert!(json.contains("value_preview"));
     }
 
     #[test]

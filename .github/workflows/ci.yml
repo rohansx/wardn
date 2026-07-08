@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --all-targets --features test-fast-kdf
+
+      - name: Test
+        # test-fast-kdf swaps in a cheap Argon2id param set for the
+        # integration tests — without it, tests/*.rs won't compile, since
+        # Vault::create_fast/open_fast are only exposed under this feature
+        # (they're cfg(test) inside the lib crate itself, which integration
+        # tests — separate compilation units — can't see).
+        run: cargo test --features test-fast-kdf
+
+      - name: Clippy
+        run: cargo clippy --all-targets --features test-fast-kdf -- -D warnings
+
+      - name: Format check
+        run: cargo fmt --check

@@ -6,6 +6,8 @@ use tokio::sync::RwLock;
 use tower::ServiceExt;
 
 use wardn::config::{CredentialConfig, RateLimitConfig, TimePeriod, WardenConfig};
+use wardn::proxy::budget::BudgetTracker;
+use wardn::proxy::loop_guard::LoopGuard;
 use wardn::proxy::rate_limit::RateLimiter;
 use wardn::proxy::{self, ProxyState};
 use wardn::Vault;
@@ -18,6 +20,9 @@ fn test_state() -> (Arc<ProxyState>, String) {
             "OPENAI_KEY",
             "sk-proj-real-key-123",
             &CredentialConfig {
+                scrub_patterns: Vec::new(),
+                oauth: None,
+                budget: None,
                 allowed_agents: vec!["researcher".to_string()],
                 allowed_domains: vec!["api.openai.com".to_string()],
                 rate_limit: None,
@@ -33,6 +38,8 @@ fn test_state() -> (Arc<ProxyState>, String) {
     let state = Arc::new(ProxyState {
         vault: Arc::new(RwLock::new(vault)),
         rate_limiter: Arc::new(tokio::sync::Mutex::new(RateLimiter::new())),
+        budget_tracker: Arc::new(tokio::sync::Mutex::new(BudgetTracker::new())),
+        loop_guard: Arc::new(tokio::sync::Mutex::new(LoopGuard::default())),
         config: WardenConfig::default(),
         http_client: reqwest::Client::new(),
     });
@@ -145,6 +152,9 @@ async fn test_proxy_rate_limits() {
             "KEY",
             "secret-key-value-long",
             &CredentialConfig {
+                scrub_patterns: Vec::new(),
+                oauth: None,
+                budget: None,
                 allowed_agents: vec![],
                 allowed_domains: vec![],
                 rate_limit: Some(RateLimitConfig {
@@ -155,10 +165,7 @@ async fn test_proxy_rate_limits() {
         )
         .unwrap();
 
-    let placeholder = vault
-        .get_placeholder("KEY", "bot")
-        .unwrap()
-        .to_string();
+    let placeholder = vault.get_placeholder("KEY", "bot").unwrap().to_string();
 
     let mut rl = RateLimiter::new();
     rl.configure(
@@ -173,6 +180,8 @@ async fn test_proxy_rate_limits() {
     let state = Arc::new(ProxyState {
         vault: Arc::new(RwLock::new(vault)),
         rate_limiter: Arc::new(tokio::sync::Mutex::new(rl)),
+        budget_tracker: Arc::new(tokio::sync::Mutex::new(BudgetTracker::new())),
+        loop_guard: Arc::new(tokio::sync::Mutex::new(LoopGuard::default())),
         config: WardenConfig::default(),
         http_client: reqwest::Client::new(),
     });

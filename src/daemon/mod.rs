@@ -5,6 +5,8 @@ use tokio::sync::{Mutex, RwLock};
 
 use crate::config::WardenConfig;
 use crate::mcp::WardenMcpServer;
+use crate::proxy::budget::BudgetTracker;
+use crate::proxy::loop_guard::LoopGuard;
 use crate::proxy::rate_limit::RateLimiter;
 use crate::proxy::{self, ProxyState};
 use crate::vault::Vault;
@@ -30,6 +32,8 @@ impl Default for DaemonConfig {
 pub struct Daemon {
     vault: Arc<RwLock<Vault>>,
     rate_limiter: Arc<Mutex<RateLimiter>>,
+    budget_tracker: Arc<Mutex<BudgetTracker>>,
+    loop_guard: Arc<Mutex<LoopGuard>>,
     config: DaemonConfig,
 }
 
@@ -47,9 +51,15 @@ impl Daemon {
             }
         }
 
+        // Budgets are NOT seeded from config here — unlike rate limits,
+        // they're read live from the vault on every proxy request (see
+        // proxy::mod's budget check), so `wardn budget set` takes effect
+        // immediately without a daemon restart.
         Self {
             vault: Arc::new(RwLock::new(vault)),
             rate_limiter: Arc::new(Mutex::new(rate_limiter)),
+            budget_tracker: Arc::new(Mutex::new(BudgetTracker::new())),
+            loop_guard: Arc::new(Mutex::new(LoopGuard::default())),
             config,
         }
     }
@@ -59,6 +69,8 @@ impl Daemon {
         let state = Arc::new(ProxyState {
             vault: self.vault.clone(),
             rate_limiter: self.rate_limiter.clone(),
+            budget_tracker: self.budget_tracker.clone(),
+            loop_guard: self.loop_guard.clone(),
             config: self.config.warden_config.clone(),
             http_client: reqwest::Client::new(),
         });
@@ -85,12 +97,7 @@ impl Daemon {
     /// Start the MCP server over stdio (blocking).
     pub async fn serve_mcp(&self, agent_id: String) -> Result<(), Box<dyn std::error::Error>> {
         tracing::info!("wardn MCP server starting for agent: {agent_id}");
-        WardenMcpServer::serve_stdio(
-            self.vault.clone(),
-            self.rate_limiter.clone(),
-            agent_id,
-        )
-        .await
+        WardenMcpServer::serve_stdio(self.vault.clone(), self.rate_limiter.clone(), agent_id).await
     }
 
     /// Start both proxy and MCP concurrently.
@@ -127,6 +134,16 @@ impl Daemon {
     pub fn rate_limiter(&self) -> &Arc<Mutex<RateLimiter>> {
         &self.rate_limiter
     }
+
+    /// Get a reference to the budget tracker.
+    pub fn budget_tracker(&self) -> &Arc<Mutex<BudgetTracker>> {
+        &self.budget_tracker
+    }
+
+    /// Get a reference to the loop guard.
+    pub fn loop_guard(&self) -> &Arc<Mutex<LoopGuard>> {
+        &self.loop_guard
+    }
 }
 
 #[cfg(test)]
@@ -147,6 +164,9 @@ mod tests {
         warden_config.credentials.insert(
             "KEY".to_string(),
             CredentialConfig {
+                scrub_patterns: Vec::new(),
+                oauth: None,
+                budget: None,
                 allowed_agents: vec!["bot".to_string()],
                 allowed_domains: vec![],
                 rate_limit: Some(RateLimitConfig {
@@ -199,6 +219,9 @@ mod tests {
                 "KEY",
                 "secret-long-value",
                 &CredentialConfig {
+                    scrub_patterns: Vec::new(),
+                    oauth: None,
+                    budget: None,
                     allowed_agents: vec![],
                     allowed_domains: vec!["api.good.com".to_string()],
                     rate_limit: None,

@@ -7,6 +7,12 @@ use serde::Serialize;
 pub struct FoundCredential {
     pub name: String,
     pub value_preview: String, // first 8 chars + "..."
+    /// The full real value — deliberately NOT serialized (`#[serde(skip)]`).
+    /// `to_terminal_string`/JSON export must only ever show `value_preview`;
+    /// this field exists so `migrate` (non-dry-run) can actually store the
+    /// real credential in the vault instead of a placeholder marker.
+    #[serde(skip)]
+    pub value: String,
     pub source_file: String,
     pub category: CredentialCategory,
     pub severity: Severity,
@@ -133,6 +139,7 @@ pub fn scan_content(content: &str, source_file: &str) -> Vec<FoundCredential> {
                     found.push(FoundCredential {
                         name: key.to_string(),
                         value_preview: preview,
+                        value: value.to_string(),
                         source_file: source_file.to_string(),
                         category: pattern.category.clone(),
                         severity: pattern.severity,
@@ -157,7 +164,10 @@ pub fn scan_content(content: &str, source_file: &str) -> Vec<FoundCredential> {
                         // Avoid duplicates from key=value parsing above
                         let already_found = found.iter().any(|f| {
                             f.source_file == source_file
-                                && value.starts_with(&f.value_preview[..f.value_preview.len().min(8).min(value.len())])
+                                && value.starts_with(
+                                    &f.value_preview
+                                        [..f.value_preview.len().min(8).min(value.len())],
+                                )
                         });
                         if !already_found {
                             let preview = if value.len() > 12 {
@@ -168,6 +178,7 @@ pub fn scan_content(content: &str, source_file: &str) -> Vec<FoundCredential> {
                             found.push(FoundCredential {
                                 name: pattern.name.to_string(),
                                 value_preview: preview,
+                                value: value.to_string(),
                                 source_file: source_file.to_string(),
                                 category: pattern.category.clone(),
                                 severity: pattern.severity,
@@ -206,14 +217,8 @@ pub fn scan_directory(dir: &Path) -> Vec<FoundCredential> {
             }
             results.extend(scan_directory(&path));
         } else if path.is_file() {
-            let ext = path
-                .extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or("");
-            let name = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("");
+            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
 
             // Only scan text config files
             let scannable = matches!(
@@ -294,6 +299,27 @@ DATABASE_URL=postgres://localhost/mydb
 
         let anthropic = results.iter().find(|r| r.name == "ANTHROPIC_API_KEY");
         assert!(anthropic.is_some());
+    }
+
+    #[test]
+    fn test_scan_captures_real_value_not_just_preview() {
+        let content = "OPENAI_API_KEY=sk-proj-abc123def456ghi789\n";
+        let results = scan_content(content, ".env");
+        let openai = results.iter().find(|r| r.name == "OPENAI_API_KEY").unwrap();
+
+        assert_eq!(openai.value, "sk-proj-abc123def456ghi789");
+        // The preview is still a truncated, distinct representation.
+        assert_ne!(openai.value, openai.value_preview);
+        assert!(openai.value_preview.contains("..."));
+    }
+
+    #[test]
+    fn test_found_credential_serialization_never_includes_value() {
+        let content = "OPENAI_API_KEY=sk-proj-abc123def456ghi789\n";
+        let results = scan_content(content, ".env");
+        let json = serde_json::to_string(&results[0]).unwrap();
+        assert!(!json.contains("sk-proj-abc123def456ghi789"));
+        assert!(json.contains("value_preview"));
     }
 
     #[test]
@@ -385,12 +411,17 @@ timeout = 30
 
     #[test]
     fn test_stripe_live_vs_test() {
-        let content = "STRIPE_LIVE=sk_live_abcdef1234567890\nSTRIPE_TEST=sk_test_abcdef1234567890\n";
+        let content =
+            "STRIPE_LIVE=sk_live_abcdef1234567890\nSTRIPE_TEST=sk_test_abcdef1234567890\n";
         let results = scan_content(content, ".env");
         assert!(results.len() >= 2);
 
-        let live = results.iter().find(|r| r.value_preview.starts_with("sk_live_"));
-        let test = results.iter().find(|r| r.value_preview.starts_with("sk_test_"));
+        let live = results
+            .iter()
+            .find(|r| r.value_preview.starts_with("sk_live_"));
+        let test = results
+            .iter()
+            .find(|r| r.value_preview.starts_with("sk_test_"));
         assert!(live.is_some());
         assert!(test.is_some());
         assert_eq!(live.unwrap().severity, Severity::Critical);

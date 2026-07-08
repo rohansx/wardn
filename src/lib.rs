@@ -36,6 +36,23 @@ pub enum WardenError {
         retry_after_seconds: u64,
     },
 
+    #[error("budget exceeded for '{credential}' by agent '{agent_id}': spent ${spent_usd:.4} of ${max_usd:.2}")]
+    BudgetExceeded {
+        credential: String,
+        agent_id: String,
+        spent_usd: f64,
+        max_usd: f64,
+    },
+
+    #[error("agent '{agent_id}' repeated an identical request {repeat_count} times — possible stuck loop")]
+    LoopDetected {
+        agent_id: String,
+        repeat_count: usize,
+    },
+
+    #[error("OAuth token refresh failed for '{credential}': {reason}")]
+    OAuthRefreshFailed { credential: String, reason: String },
+
     #[error("configuration error: {0}")]
     Config(String),
 
@@ -47,6 +64,9 @@ pub enum WardenError {
 
     #[error("invalid vault format: {0}")]
     InvalidFormat(String),
+
+    #[error("OS keychain error: {0}")]
+    Keyring(String),
 }
 
 pub type Result<T> = std::result::Result<T, WardenError>;

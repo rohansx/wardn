@@ -16,9 +16,11 @@ pub async fn run(args: &ServeArgs, vault_path: &Path, config_path: Option<&Path>
     let passphrase = if let Ok(pass) = std::env::var("WARDN_PASSPHRASE") {
         tracing::warn!("using passphrase from WARDN_PASSPHRASE env var");
         pass
+    } else if let Some(pass) = wardn::vault::keyring_store::retrieve_passphrase(vault_path) {
+        tracing::info!("using passphrase from OS keychain");
+        pass
     } else {
-        rpassword::prompt_password("Passphrase: ")
-            .context("failed to read passphrase")?
+        rpassword::prompt_password("Passphrase: ").context("failed to read passphrase")?
     };
 
     let vault = Vault::open(vault_path, &passphrase)?;

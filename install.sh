@@ -53,6 +53,23 @@ download() {
     fi
 }
 
+# Verify the downloaded archive against the .sha256 the release workflow
+# publishes alongside it. Fails closed: a missing/mismatched checksum aborts
+# the install rather than silently trusting an unverified binary.
+verify_checksum() {
+    archive="$1"
+    checksum_file="$2"
+
+    if command -v sha256sum >/dev/null 2>&1; then
+        (cd "$(dirname "$archive")" && sha256sum -c "$(basename "$checksum_file")") >/dev/null 2>&1
+    elif command -v shasum >/dev/null 2>&1; then
+        (cd "$(dirname "$archive")" && shasum -a 256 -c "$(basename "$checksum_file")") >/dev/null 2>&1
+    else
+        echo "warning: no sha256sum/shasum found — skipping checksum verification" >&2
+        return 0
+    fi
+}
+
 main() {
     echo "installing wardn..."
 
@@ -66,7 +83,9 @@ main() {
     fi
 
     ARTIFACT="wardn-${PLATFORM}"
-    URL="https://github.com/${REPO}/releases/download/${VERSION}/${ARTIFACT}.tar.gz"
+    BASE_URL="https://github.com/${REPO}/releases/download/${VERSION}"
+    URL="${BASE_URL}/${ARTIFACT}.tar.gz"
+    CHECKSUM_URL="${BASE_URL}/${ARTIFACT}.tar.gz.sha256"
 
     echo "  version:  ${VERSION}"
     echo "  platform: ${PLATFORM}"
@@ -78,6 +97,18 @@ main() {
 
     echo "downloading ${URL}..."
     download "$URL" "${TMPDIR}/${ARTIFACT}.tar.gz"
+    download "$CHECKSUM_URL" "${TMPDIR}/${ARTIFACT}.tar.gz.sha256"
+
+    if [ -s "${TMPDIR}/${ARTIFACT}.tar.gz.sha256" ]; then
+        echo "verifying checksum..."
+        if ! verify_checksum "${TMPDIR}/${ARTIFACT}.tar.gz" "${TMPDIR}/${ARTIFACT}.tar.gz.sha256"; then
+            echo "error: checksum verification failed — the download may be corrupted or tampered with" >&2
+            echo "aborting install." >&2
+            exit 1
+        fi
+    else
+        echo "warning: could not fetch checksum file — proceeding without verification" >&2
+    fi
 
     tar xzf "${TMPDIR}/${ARTIFACT}.tar.gz" -C "$TMPDIR"
 
@@ -91,12 +122,20 @@ main() {
     chmod +x "${INSTALL_DIR}/wardn"
 
     echo ""
+    if ! "${INSTALL_DIR}/wardn" --version >/dev/null 2>&1; then
+        echo "warning: installed binary did not run cleanly — check ${INSTALL_DIR}/wardn manually" >&2
+    fi
+
     echo "wardn ${VERSION} installed to ${INSTALL_DIR}/wardn"
     echo ""
     echo "get started:"
     echo "  wardn vault create"
-    echo "  wardn vault set OPENAI_KEY"
-    echo "  wardn serve"
+    echo "  wardn vault set ANTHROPIC_KEY --domain api.anthropic.com"
+    echo "  wardn setup claude-code --alias   # or: wardn run --agent claude-code -- claude"
+    echo ""
+    echo "  wardn setup claude-code registers the MCP server; --alias also makes"
+    echo "  plain \`claude\` transparently route through the wardn proxy, so the"
+    echo "  real API key never enters Claude Code's process or context window."
 }
 
 main

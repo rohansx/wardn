@@ -1,4 +1,6 @@
+pub mod budget_cmd;
 pub mod migrate_cmd;
+pub mod run_cmd;
 pub mod serve_cmd;
 pub mod setup_cmd;
 pub mod vault_cmd;
@@ -38,6 +40,21 @@ pub enum Commands {
     /// Start the wardn proxy server
     Serve(ServeArgs),
 
+    /// Launch an agent with its traffic routed through wardn.
+    ///
+    /// Lazy-starts the proxy daemon if it isn't already running, resolves
+    /// placeholders for known credentials, points the child process at the
+    /// proxy via base-URL env vars, and execs it. This is what actually
+    /// wires an agent's real traffic through wardn — `wardn setup` alone
+    /// only registers the MCP server.
+    Run(RunArgs),
+
+    /// Manage dollar-denominated spend caps ("denial of wallet" protection)
+    Budget {
+        #[command(subcommand)]
+        command: BudgetCommands,
+    },
+
     /// Scan for exposed credentials and migrate them
     Migrate(MigrateArgs),
 
@@ -57,6 +74,16 @@ pub enum VaultCommands {
     Set {
         /// Credential name (e.g. OPENAI_KEY)
         key: String,
+
+        /// Restrict this credential to specific domain(s) — repeatable
+        /// (--domain api.openai.com --domain api.example.com). Without
+        /// this, a leaked placeholder can be pointed at ANY domain through
+        /// the proxy, injecting the real key into a request to an
+        /// attacker's server. If omitted interactively, you'll be
+        /// prompted; in non-interactive/scripted use (WARDN_VALUE set)
+        /// it defaults to unrestricted with a loud warning.
+        #[arg(long = "domain")]
+        domains: Vec<String>,
     },
 
     /// Get the placeholder token for a credential (never the real value)
@@ -105,6 +132,34 @@ pub struct ServeArgs {
 }
 
 #[derive(Parser)]
+pub struct RunArgs {
+    /// Agent identity — determines which credentials/placeholders are used
+    /// and which ACLs/rate limits apply.
+    #[arg(long, default_value = "cli")]
+    pub agent: String,
+
+    /// Host the wardn proxy binds to (and is looked for / started on).
+    #[arg(long, default_value = "127.0.0.1")]
+    pub host: String,
+
+    /// Port the wardn proxy binds to.
+    #[arg(long, default_value_t = 7777)]
+    pub port: u16,
+
+    /// Cap total spend on every credential this agent uses at this many
+    /// USD (hard stop, resets never — a lifetime cap). This SETS the
+    /// credential's budget in the vault (same as `wardn budget set`), so
+    /// it persists after this run exits — clear it with `wardn budget
+    /// clear <credential>` if you don't want it to carry over.
+    #[arg(long, value_name = "USD")]
+    pub max_cost: Option<f64>,
+
+    /// The command to run, e.g. `wardn run -- claude`.
+    #[arg(last = true, required = true, value_name = "COMMAND")]
+    pub command: Vec<String>,
+}
+
+#[derive(Parser)]
 pub struct MigrateArgs {
     /// Source system to scan
     #[arg(long, value_enum, default_value = "claude-code")]
@@ -127,10 +182,115 @@ pub enum MigrateSourceArg {
 }
 
 #[derive(Subcommand)]
+pub enum BudgetCommands {
+    /// Set a dollar spend cap on a credential (applies per agent — each
+    /// authorized agent gets its own independent budget of this size).
+    Set {
+        /// Credential name (e.g. OPENAI_KEY)
+        credential: String,
+
+        /// Max spend in USD before requests are blocked (hard mode) or
+        /// flagged (soft mode).
+        #[arg(long, value_name = "USD")]
+        usd: f64,
+
+        /// How often the spend counter resets.
+        #[arg(long, value_enum, default_value = "day")]
+        window: BudgetWindowArg,
+
+        /// hard = block once exceeded. soft = allow but flag/log.
+        #[arg(long, value_enum, default_value = "hard")]
+        mode: BudgetModeArg,
+    },
+
+    /// Remove the spend cap from a credential (unlimited again).
+    Clear {
+        /// Credential name to clear the budget from
+        credential: String,
+    },
+
+    /// Show live spend against configured budgets — queries the running
+    /// wardn daemon (needs `wardn serve` or `wardn run` already up).
+    Status {
+        /// Agent identity to show spend for
+        #[arg(long, default_value = "cli")]
+        agent: String,
+
+        /// Host the wardn daemon is running on
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+
+        /// Port the wardn daemon is running on
+        #[arg(long, default_value_t = 7777)]
+        port: u16,
+    },
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+pub enum BudgetWindowArg {
+    Hour,
+    Day,
+    Week,
+    Month,
+    Total,
+}
+
+impl From<BudgetWindowArg> for wardn::config::BudgetWindow {
+    fn from(arg: BudgetWindowArg) -> Self {
+        match arg {
+            BudgetWindowArg::Hour => wardn::config::BudgetWindow::Hour,
+            BudgetWindowArg::Day => wardn::config::BudgetWindow::Day,
+            BudgetWindowArg::Week => wardn::config::BudgetWindow::Week,
+            BudgetWindowArg::Month => wardn::config::BudgetWindow::Month,
+            BudgetWindowArg::Total => wardn::config::BudgetWindow::Total,
+        }
+    }
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+pub enum BudgetModeArg {
+    Hard,
+    Soft,
+}
+
+impl From<BudgetModeArg> for wardn::config::BudgetMode {
+    fn from(arg: BudgetModeArg) -> Self {
+        match arg {
+            BudgetModeArg::Hard => wardn::config::BudgetMode::Hard,
+            BudgetModeArg::Soft => wardn::config::BudgetMode::Soft,
+        }
+    }
+}
+
+#[derive(Subcommand)]
 pub enum SetupCommands {
     /// Register wardn as an MCP server in Claude Code
-    ClaudeCode,
+    ClaudeCode {
+        /// Also add a shell alias so plain `claude` transparently routes
+        /// through `wardn run` — without this, MCP registration alone does
+        /// NOT put the agent's traffic through the wardn proxy.
+        #[arg(long)]
+        alias: bool,
+    },
 
     /// Register wardn as an MCP server in Cursor
     Cursor,
+
+    /// Add a shell alias so `codex` transparently routes through
+    /// `wardn run` — Codex has no wardn-fabricated MCP config here, so
+    /// this is the only integration path (same mechanism as
+    /// `claude-code --alias`, see `wardn run`).
+    Codex,
+
+    /// Add a shell alias so `gemini` transparently routes through
+    /// `wardn run`.
+    Gemini,
+
+    /// Add a shell alias so `opencode` transparently routes through
+    /// `wardn run`.
+    OpenCode,
+
+    /// Add a shell alias so `aider` transparently routes through
+    /// `wardn run`.
+    Aider,
 }

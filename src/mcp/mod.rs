@@ -23,6 +23,10 @@ pub struct WardenMcpServer {
     vault: Arc<RwLock<Vault>>,
     rate_limiter: Arc<Mutex<RateLimiter>>,
     agent_id: String,
+    // Read by the rmcp `#[tool_handler]`/`#[tool_router]` macro expansion
+    // (dispatches tool calls through it), not by any code in this file —
+    // clippy's dead-code analysis doesn't see that usage.
+    #[allow(dead_code)]
     tool_router: ToolRouter<Self>,
 }
 
@@ -50,7 +54,9 @@ impl WardenMcpServer {
     ///
     /// Returns a unique placeholder that maps to the real credential value.
     /// The real value is never exposed — it is injected at the proxy layer.
-    #[tool(description = "Get a placeholder token for a named credential. The placeholder is unique to your agent and can be used in API calls routed through Warden. The real credential is never returned.")]
+    #[tool(
+        description = "Get a placeholder token for a named credential. The placeholder is unique to your agent and can be used in API calls routed through Warden. The real credential is never returned."
+    )]
     async fn get_credential_ref(
         &self,
         Parameters(params): Parameters<GetCredentialRefParams>,
@@ -89,7 +95,9 @@ impl WardenMcpServer {
     /// List credentials available to the calling agent.
     ///
     /// Returns credential names and metadata. Never returns actual values.
-    #[tool(description = "List all credentials your agent is authorized to access. Returns names and metadata only — never actual secret values.")]
+    #[tool(
+        description = "List all credentials your agent is authorized to access. Returns names and metadata only — never actual secret values."
+    )]
     async fn list_credentials(
         &self,
         Parameters(_params): Parameters<ListCredentialsParams>,
@@ -101,8 +109,7 @@ impl WardenMcpServer {
         let credentials: Vec<CredentialEntry> = all
             .into_iter()
             .filter(|info| {
-                info.allowed_agents.is_empty()
-                    || info.allowed_agents.contains(&self.agent_id)
+                info.allowed_agents.is_empty() || info.allowed_agents.contains(&self.agent_id)
             })
             .map(|info| CredentialEntry {
                 name: info.name,
@@ -113,14 +120,15 @@ impl WardenMcpServer {
             .collect();
 
         let resp = ListCredentialsResponse { credentials };
-        serde_json::to_string_pretty(&resp)
-            .unwrap_or_else(|e| format!(r#"{{"error": "{}"}}"#, e))
+        serde_json::to_string_pretty(&resp).unwrap_or_else(|e| format!(r#"{{"error": "{}"}}"#, e))
     }
 
     /// Check rate limit status for a credential.
     ///
     /// Returns remaining quota, limit, and period.
-    #[tool(description = "Check your remaining rate limit quota for a credential. Returns how many calls you have left and when the limit resets.")]
+    #[tool(
+        description = "Check your remaining rate limit quota for a credential. Returns how many calls you have left and when the limit resets."
+    )]
     async fn check_rate_limit(
         &self,
         Parameters(params): Parameters<CheckRateLimitParams>,
@@ -212,6 +220,9 @@ mod tests {
                 "OPENAI_KEY",
                 "sk-proj-real-key-123",
                 &CredentialConfig {
+                    scrub_patterns: Vec::new(),
+                    oauth: None,
+                    budget: None,
                     allowed_agents: vec!["researcher".to_string(), "writer".to_string()],
                     allowed_domains: vec!["api.openai.com".to_string()],
                     rate_limit: Some(RateLimitConfig {
@@ -226,6 +237,9 @@ mod tests {
                 "ANTHROPIC_KEY",
                 "sk-ant-456",
                 &CredentialConfig {
+                    scrub_patterns: Vec::new(),
+                    oauth: None,
+                    budget: None,
                     allowed_agents: vec!["researcher".to_string()],
                     allowed_domains: vec!["api.anthropic.com".to_string()],
                     rate_limit: None,
@@ -315,10 +329,7 @@ mod tests {
         // "researcher" should see both OPENAI_KEY and ANTHROPIC_KEY
         assert_eq!(creds.len(), 2);
 
-        let names: Vec<&str> = creds
-            .iter()
-            .map(|c| c["name"].as_str().unwrap())
-            .collect();
+        let names: Vec<&str> = creds.iter().map(|c| c["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"OPENAI_KEY"));
         assert!(names.contains(&"ANTHROPIC_KEY"));
 
@@ -335,6 +346,9 @@ mod tests {
                 "SECRET_KEY",
                 "secret",
                 &CredentialConfig {
+                    scrub_patterns: Vec::new(),
+                    oauth: None,
+                    budget: None,
                     allowed_agents: vec!["admin-only".to_string()],
                     allowed_domains: vec![],
                     rate_limit: None,
@@ -410,8 +424,14 @@ mod tests {
 
         // None of the responses should contain real credential values
         for resp in [&r1, &r2, &r3] {
-            assert!(!resp.contains("sk-proj-real-key-123"), "leaked OPENAI_KEY in: {resp}");
-            assert!(!resp.contains("sk-ant-456"), "leaked ANTHROPIC_KEY in: {resp}");
+            assert!(
+                !resp.contains("sk-proj-real-key-123"),
+                "leaked OPENAI_KEY in: {resp}"
+            );
+            assert!(
+                !resp.contains("sk-ant-456"),
+                "leaked ANTHROPIC_KEY in: {resp}"
+            );
         }
     }
 
@@ -421,9 +441,6 @@ mod tests {
         let info = server.get_info();
 
         assert!(info.instructions.is_some());
-        assert!(info
-            .instructions
-            .unwrap()
-            .contains("Warden"));
+        assert!(info.instructions.unwrap().contains("Warden"));
     }
 }

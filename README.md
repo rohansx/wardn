@@ -114,7 +114,14 @@ Agent sends request with placeholder in Authorization header
 ## Install
 
 ```bash
+# Prebuilt binary (Linux/macOS, amd64/arm64), checksum-verified
+curl -sSf https://raw.githubusercontent.com/rohansx/wardn/main/install.sh | sh
+
+# or from crates.io
 cargo install wardn
+
+# or Homebrew, once the tap is published (see Formula/wardn.rb)
+brew install rohansx/wardn/wardn
 ```
 
 ## Quick Start
@@ -249,7 +256,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-wardn = "0.3"
+wardn = "0.4"
 ```
 
 ### Vault Operations
@@ -336,6 +343,11 @@ MCP tools exposed (read-only, no credential values ever returned):
 | **dotenv + .gitignore** | Keep secrets out of git | Keys still in memory, env vars, logs. Wardn removes them from all three. |
 | **Service meshes** (Istio, Linkerd) | Service-to-service auth | Solve infra-level mTLS. Wardn solves agent-to-API auth where the agent itself is untrusted. |
 
+For a deeper comparison against wardn's closest direct peers (Infisical
+Agent Vault, 1Password for Agents, LiteLLM virtual keys) and how wardn's
+guarantees map to OWASP's Agentic Top 10 and the MCP spec's security
+guidance, see [docs/comparison.md](docs/comparison.md).
+
 ### Trust Boundary
 
 Wardn concentrates trust in a single local process (the proxy) instead of spreading it across every plugin, tool, and LLM context window. This is a smaller attack surface, not zero attack surface:
@@ -384,19 +396,24 @@ wardn/
 │   │   ├── mod.rs          # Clap argument definitions
 │   │   ├── vault_cmd.rs    # Vault subcommand handlers
 │   │   ├── serve_cmd.rs    # Serve subcommand handler
-│   │   ├── setup_cmd.rs    # Claude Code / Cursor MCP setup
+│   │   ├── run_cmd.rs      # `wardn run` — lazy-starts the daemon, wires
+│   │   │                   #   agent env vars, execs the child
+│   │   ├── setup_cmd.rs    # Claude Code / Cursor MCP setup (+ shell alias)
 │   │   └── migrate_cmd.rs  # Migrate subcommand handler
 │   ├── lib.rs              # Public API, WardenError
-│   ├── config.rs           # TOML configuration parsing
+│   ├── config.rs           # TOML configuration parsing, [upstreams] map
 │   ├── vault/
 │   │   ├── mod.rs          # Vault CRUD operations
 │   │   ├── encryption.rs   # AES-256-GCM + Argon2id + zeroize types
 │   │   ├── storage.rs      # On-disk format (WDNV), atomic writes
-│   │   └── placeholder.rs  # Token generation, per-agent isolation
+│   │   ├── placeholder.rs  # Token generation, per-agent isolation
+│   │   └── keyring_store.rs # OS keychain passphrase storage
 │   ├── proxy/
 │   │   ├── mod.rs          # HTTP proxy server (axum)
+│   │   ├── route.rs        # Provider-prefix vs Host-header upstream routing
 │   │   ├── inject.rs       # Credential injection into requests
-│   │   ├── strip.rs        # Credential stripping from responses
+│   │   ├── strip.rs        # Credential stripping (shared pair-building)
+│   │   ├── stream.rs       # Streaming (SSE/chunked) credential stripper
 │   │   └── rate_limit.rs   # Token bucket rate limiter
 │   ├── mcp/
 │   │   ├── mod.rs          # MCP server (rmcp, stdio transport)
@@ -410,7 +427,21 @@ wardn/
 └── tests/
     ├── cli_tests.rs        # CLI integration tests
     ├── vault_tests.rs      # Vault integration tests
-    └── proxy_tests.rs      # Proxy integration tests
+    ├── proxy_tests.rs      # Proxy tests without a real upstream
+    ├── proxy_e2e_tests.rs  # Real upstream via wiremock (header/body/SSE)
+    └── run_cmd_tests.rs    # Real end-to-end `wardn run`
+```
+
+## Development
+
+```bash
+# Integration tests use a fast (insecure) KDF so the suite runs in
+# milliseconds instead of paying the real Argon2id cost per test —
+# always pass this feature flag when running tests locally or in CI:
+cargo test --features test-fast-kdf
+
+cargo build
+cargo clippy --all-targets --features test-fast-kdf
 ```
 
 ## Vault Encryption

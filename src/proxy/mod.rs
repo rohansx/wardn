@@ -1,26 +1,38 @@
+pub mod budget;
+pub mod cost;
 pub mod inject;
+pub mod loop_guard;
+pub mod oauth;
 pub mod rate_limit;
+pub mod route;
+pub mod stream;
 pub mod strip;
 
 use std::sync::Arc;
 
 use axum::body::Body;
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::{HeaderMap, HeaderValue, Request, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::any;
 use axum::Router;
+use futures_util::StreamExt;
+use serde::Deserialize;
 use tokio::sync::RwLock;
 
 use crate::config::WardenConfig;
 use crate::vault::Vault;
 use crate::WardenError;
+use loop_guard::LoopGuard;
 use rate_limit::RateLimiter;
+use stream::StreamingStripper;
 
 /// Shared state for the proxy server.
 pub struct ProxyState {
     pub vault: Arc<RwLock<Vault>>,
     pub rate_limiter: Arc<tokio::sync::Mutex<RateLimiter>>,
+    pub budget_tracker: Arc<tokio::sync::Mutex<budget::BudgetTracker>>,
+    pub loop_guard: Arc<tokio::sync::Mutex<LoopGuard>>,
     pub config: WardenConfig,
     pub http_client: reqwest::Client,
 }
@@ -38,6 +50,7 @@ fn generate_request_id() -> String {
 pub fn build_router(state: Arc<ProxyState>) -> Router {
     Router::new()
         .route("/health", axum::routing::get(health_handler))
+        .route("/_wardn/budget", axum::routing::get(budget_status_handler))
         .fallback(any(proxy_handler))
         .with_state(state)
 }
@@ -46,10 +59,62 @@ async fn health_handler() -> impl IntoResponse {
     (StatusCode::OK, "ok")
 }
 
-async fn proxy_handler(
+#[derive(Debug, Deserialize)]
+struct BudgetStatusQuery {
+    agent: String,
+}
+
+/// Live budget status for every credential an agent can use — the source
+/// `wardn budget status` queries, since spend is tracked in the running
+/// daemon's `BudgetTracker`, not in the vault (which only holds the config).
+async fn budget_status_handler(
     State(state): State<Arc<ProxyState>>,
-    req: Request<Body>,
-) -> Response {
+    Query(params): Query<BudgetStatusQuery>,
+) -> impl IntoResponse {
+    {
+        let mut vault = state.vault.write().await;
+        if let Err(e) = vault.reload() {
+            tracing::warn!(error = %e, "vault reload failed, using cached state");
+        }
+    }
+
+    let vault = state.vault.read().await;
+    let mut bt = state.budget_tracker.lock().await;
+
+    let credentials: Vec<serde_json::Value> = vault
+        .list()
+        .into_iter()
+        .filter(|info| {
+            info.allowed_agents.is_empty() || info.allowed_agents.contains(&params.agent)
+        })
+        .map(|info| match vault.budget_config(&info.name) {
+            Some(cfg) => {
+                bt.ensure_configured(&info.name, &params.agent, *cfg);
+                let status = bt.status(&info.name, &params.agent).unwrap();
+                serde_json::json!({
+                    "credential": info.name,
+                    "configured": true,
+                    "spent_usd": status.spent_usd,
+                    "max_usd": status.max_usd,
+                    "remaining_usd": status.remaining_usd,
+                    "window": format!("{:?}", status.window).to_lowercase(),
+                    "mode": format!("{:?}", status.mode).to_lowercase(),
+                })
+            }
+            None => serde_json::json!({
+                "credential": info.name,
+                "configured": false,
+            }),
+        })
+        .collect();
+
+    axum::Json(serde_json::json!({
+        "agent": params.agent,
+        "credentials": credentials,
+    }))
+}
+
+async fn proxy_handler(State(state): State<Arc<ProxyState>>, req: Request<Body>) -> Response {
     match handle_proxy_request(state, req).await {
         Ok(response) => response,
         Err(e) => {
@@ -73,7 +138,14 @@ async fn handle_proxy_request(
         .map(|s| s.to_string())
         .unwrap_or_else(|| "anonymous".to_string());
 
-    // 2. Extract destination from Host header or URL
+    // 2. Resolve where this request actually goes.
+    //
+    // A base-URL SDK override (e.g. ANTHROPIC_BASE_URL=http://127.0.0.1:7777/anthropic)
+    // sends `Host: 127.0.0.1:7777` — the proxy's own address — so the Host
+    // header alone can't identify the upstream in that case. route::resolve_route
+    // first checks for a configured provider-prefix (`/anthropic/...`,
+    // `/openai/...`) and only falls back to Host-header routing for plain
+    // forward-proxy usage.
     let host = req
         .headers()
         .get("host")
@@ -81,9 +153,16 @@ async fn handle_proxy_request(
         .map(|s| s.to_string())
         .unwrap_or_default();
 
-    let domain = host.split(':').next().unwrap_or(&host).to_string();
     let method = req.method().to_string();
     let path = req.uri().path().to_string();
+    let path_and_query = req
+        .uri()
+        .path_and_query()
+        .map(|pq| pq.as_str().to_string())
+        .unwrap_or_else(|| path.clone());
+
+    let route = route::resolve_route(&path_and_query, &host, &state.config.upstreams);
+    let domain = route.domain.clone();
 
     tracing::info!(
         request_id = %request_id,
@@ -91,6 +170,7 @@ async fn handle_proxy_request(
         method = %method,
         domain = %domain,
         path = %path,
+        upstream = %route.upstream_base,
         "proxy request received"
     );
 
@@ -102,6 +182,100 @@ async fn handle_proxy_request(
 
     // 4. Strip X-Warden-Agent header (must not reach upstream)
     parts.headers.remove(AGENT_HEADER);
+
+    // 4.5. Loop/runaway detection — the SAME request (method+domain+path+
+    // body) repeated many times by the same agent in a short window trips
+    // an early stop, independent of and before any budget check. This
+    // catches a stuck retry loop even when no credential/budget is
+    // involved at all, or before a generous budget would otherwise catch it.
+    {
+        let fp = loop_guard::fingerprint(&method, &domain, &path, &body_bytes);
+        let mut lg = state.loop_guard.lock().await;
+        if let Some(repeat_count) = lg.record_and_check(&agent_id, fp) {
+            tracing::warn!(
+                request_id = %request_id,
+                agent = %agent_id,
+                repeat_count = %repeat_count,
+                domain = %domain,
+                path = %path,
+                "loop detected — blocking request"
+            );
+            return Err(WardenError::LoopDetected {
+                agent_id: agent_id.clone(),
+                repeat_count,
+            });
+        }
+    }
+
+    // Reload the vault from disk (cheap — reuses the derived key, no KDF)
+    // so a CLI-driven change in another process — `wardn budget set`,
+    // `vault rotate`, etc. — takes effect immediately on this already-
+    // running daemon rather than only after a restart. Briefly exclusive,
+    // then downgraded to a shared read lock for the rest of the request.
+    {
+        let mut vault = state.vault.write().await;
+        if let Err(e) = vault.reload() {
+            tracing::warn!(request_id = %request_id, error = %e, "vault reload failed, using cached state");
+        }
+
+        // OAuth refresh: any OAuth-backed credential whose access token is
+        // near/past expiry gets refreshed now, BEFORE injection, so the
+        // value about to be injected is current. This checks every
+        // OAuth-backed credential in the vault (not just ones this request
+        // happens to use) — simpler than threading refresh through the
+        // placeholder-scanning injection path, and cheap in the common
+        // case (no network call at all unless a token is actually close to
+        // expiring).
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+
+        for cred_name in vault.oauth_credential_names() {
+            let Some(cfg) = vault.oauth_config(&cred_name).cloned() else {
+                continue;
+            };
+            if !oauth::needs_refresh(&cfg, now_unix) {
+                continue;
+            }
+            match oauth::refresh_access_token(&state.http_client, &cred_name, &cfg, now_unix).await
+            {
+                Ok(tokens) => {
+                    tracing::info!(
+                        request_id = %request_id,
+                        credential = %cred_name,
+                        "oauth access token refreshed"
+                    );
+                    if let Err(e) = vault.update_oauth_tokens(
+                        &cred_name,
+                        &tokens.access_token,
+                        tokens.refresh_token.as_deref(),
+                        tokens.expires_at,
+                    ) {
+                        tracing::warn!(
+                            request_id = %request_id,
+                            credential = %cred_name,
+                            error = %e,
+                            "failed to persist refreshed oauth token"
+                        );
+                    }
+                }
+                Err(e) => {
+                    // Don't fail the whole request over an unrelated
+                    // credential's refresh failure — it may not even be the
+                    // one this request needs. The stale token stays in
+                    // place; injection/upstream will surface the real
+                    // failure if it's actually used.
+                    tracing::warn!(
+                        request_id = %request_id,
+                        credential = %cred_name,
+                        error = %e,
+                        "oauth token refresh failed"
+                    );
+                }
+            }
+        }
+    }
 
     // 5. Inject credentials into headers
     let vault = state.vault.read().await;
@@ -156,16 +330,54 @@ async fn handle_proxy_request(
         }
     }
 
+    // 7.5. Budget check for each injected credential. Reads the vault's
+    // CURRENT budget config live on every request (not a snapshot taken at
+    // daemon startup), so `wardn budget set` takes effect immediately.
+    {
+        let mut bt = state.budget_tracker.lock().await;
+        for cred_name in &all_injected {
+            let Some(budget_config) = vault.budget_config(cred_name) else {
+                continue;
+            };
+            bt.ensure_configured(cred_name, &agent_id, *budget_config);
+
+            match bt.check(cred_name, &agent_id) {
+                budget::BudgetCheck::Ok => {}
+                budget::BudgetCheck::ExceededSoft { spent_usd, max_usd } => {
+                    tracing::warn!(
+                        request_id = %request_id,
+                        agent = %agent_id,
+                        credential = %cred_name,
+                        spent_usd = %spent_usd,
+                        max_usd = %max_usd,
+                        "budget exceeded (soft mode — allowing request)"
+                    );
+                }
+                budget::BudgetCheck::Exceeded { spent_usd, max_usd } => {
+                    tracing::warn!(
+                        request_id = %request_id,
+                        agent = %agent_id,
+                        credential = %cred_name,
+                        spent_usd = %spent_usd,
+                        max_usd = %max_usd,
+                        "budget exceeded — blocking request"
+                    );
+                    return Err(WardenError::BudgetExceeded {
+                        credential: cred_name.clone(),
+                        agent_id: agent_id.clone(),
+                        spent_usd,
+                        max_usd,
+                    });
+                }
+            }
+        }
+    }
+
     drop(vault); // release read lock before forwarding
 
-    // 8. Build upstream URL
-    let uri = parts.uri.clone();
-    let scheme = uri.scheme_str().unwrap_or("https");
-    let path_and_query = uri
-        .path_and_query()
-        .map(|pq| pq.as_str())
-        .unwrap_or("/");
-    let upstream_url = format!("{scheme}://{host}{path_and_query}");
+    // 8. Build upstream URL from the resolved route (not the raw Host header —
+    // see the routing comment above for why).
+    let upstream_url = format!("{}{}", route.upstream_base, route.upstream_path_and_query);
 
     // 9. Forward request to upstream
     let method = match parts.method {
@@ -194,6 +406,14 @@ async fn handle_proxy_request(
         }
     }
     upstream_req = upstream_req.headers(reqwest_headers);
+
+    // Captured before injected_body is moved into the request — used for
+    // post-response cost estimation (the fallback byte-based token
+    // estimate, and a best-effort "model" from the request if the
+    // response doesn't carry one).
+    let request_body_len = injected_body.len();
+    let request_model = cost::extract_model_from_json(&injected_body);
+
     upstream_req = upstream_req.body(injected_body);
 
     let upstream_resp = upstream_req
@@ -201,74 +421,184 @@ async fn handle_proxy_request(
         .await
         .map_err(|e| WardenError::Io(std::io::Error::other(e)))?;
 
-    // 10. Read upstream response
+    // 10. Read upstream response status/headers. The body is NOT buffered —
+    // it's streamed through a StreamingStripper below, so SSE and other
+    // chunked responses forward incrementally instead of waiting for the
+    // full response (and so we never lie about content-length for a body
+    // we're about to re-chunk).
     let resp_status = upstream_resp.status();
     let resp_headers = upstream_resp.headers().clone();
-    let resp_body = upstream_resp
-        .bytes()
-        .await
-        .map_err(|e| WardenError::Io(std::io::Error::other(e)))?;
 
-    // 11. Strip credentials from response
-    let vault = state.vault.read().await;
-    let (stripped_body, strip_info) =
-        strip::strip_body(&resp_body, &agent_id, &all_injected, &vault);
-    drop(vault);
+    // Build the (real_value, placeholder, credential_name) pairs once —
+    // both header stripping and the streaming body stripper reuse them, so
+    // the vault is locked exactly once here rather than per-header/per-chunk.
+    // Scrub-pattern regexes (for derived secrets wardn never injected, e.g.
+    // a login endpoint's fresh session token) are compiled from the same
+    // injected-credential set.
+    let (pairs, scrub_regexes) = {
+        let vault = state.vault.read().await;
+        (
+            strip::build_replacement_pairs(&agent_id, &all_injected, &vault),
+            strip::compile_scrub_regexes(&all_injected, &vault),
+        )
+    };
 
-    if strip_info.stripped_count > 0 {
-        tracing::info!(
-            request_id = %request_id,
-            agent = %agent_id,
-            stripped_count = %strip_info.stripped_count,
-            credentials = ?strip_info.stripped_credentials,
-            "credentials stripped from response"
-        );
-    }
+    // 11. Build response status + headers.
+    let mut response = Response::builder()
+        .status(StatusCode::from_u16(resp_status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY));
 
-    tracing::info!(
-        request_id = %request_id,
-        agent = %agent_id,
-        upstream_status = %resp_status.as_u16(),
-        credentials_injected = %all_injected.len(),
-        credentials_stripped = %strip_info.stripped_count,
-        "proxy request completed"
-    );
-
-    // 12. Build response
-    let mut response = Response::builder().status(StatusCode::from_u16(resp_status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY));
-
-    // Copy response headers
     for (name, value) in resp_headers.iter() {
         let name_str = name.as_str();
-        // Strip credentials from response headers too
-        let vault = state.vault.read().await;
-        let (stripped_value, _) = strip::strip_header_value(
-            value.to_str().unwrap_or_default(),
-            &agent_id,
-            &all_injected,
-            &vault,
-        );
-        drop(vault);
+        // These describe the upstream's original framing, which no longer
+        // applies once the body is re-chunked below.
+        if matches!(
+            name_str.to_ascii_lowercase().as_str(),
+            "content-length" | "transfer-encoding" | "content-encoding"
+        ) {
+            continue;
+        }
+        let (stripped_value, _) =
+            strip::apply_pairs_str(value.to_str().unwrap_or_default(), &pairs);
         if let Ok(hv) = HeaderValue::from_str(&stripped_value) {
             response = response.header(name_str, hv);
         }
     }
 
-    // Add Warden metadata headers
-    if strip_info.stripped_count > 0 {
-        if let Ok(hv) = HeaderValue::from_str(&strip_info.stripped_count.to_string()) {
-            response = response.header("x-warden-stripped", hv);
+    // 12. Stream the body through the stripper. Credential-stripped /
+    // request-completed audit logs fire once the stream drains, since that's
+    // the first point the true stripped-credential set is known.
+    let mut stripper = StreamingStripper::new(pairs).with_scrub_patterns(scrub_regexes);
+    let mut upstream_bytes = upstream_resp.bytes_stream();
+    let log_request_id = request_id.clone();
+    let log_agent_id = agent_id.clone();
+    let log_injected_count = all_injected.len();
+
+    // Cost tracking taps a bounded copy of the raw (pre-strip) response
+    // bytes alongside the streamed delivery to the client — it never
+    // delays or blocks that delivery. Capped so a huge response can't grow
+    // this unboundedly; past the cap we still track the true total byte
+    // count for the byte-length fallback estimate, just stop copying bytes.
+    const COST_TAP_CAP: usize = 2_000_000;
+    let mut cost_tap: Vec<u8> = Vec::new();
+    let mut total_response_bytes: usize = 0;
+    let is_sse = resp_headers
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.contains("text/event-stream"))
+        .unwrap_or(false);
+    let provider_slug = route.provider_slug.clone();
+    let charge_credential = all_injected.first().cloned();
+    let budget_tracker = state.budget_tracker.clone();
+
+    let body_stream = async_stream::stream! {
+        while let Some(chunk) = upstream_bytes.next().await {
+            match chunk {
+                Ok(bytes) => {
+                    total_response_bytes += bytes.len();
+                    if cost_tap.len() < COST_TAP_CAP {
+                        let take = (COST_TAP_CAP - cost_tap.len()).min(bytes.len());
+                        cost_tap.extend_from_slice(&bytes[..take]);
+                    }
+
+                    let out = stripper.process_chunk(&bytes);
+                    if !out.is_empty() {
+                        yield Ok::<axum::body::Bytes, std::io::Error>(axum::body::Bytes::from(out));
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(request_id = %log_request_id, error = %e, "upstream stream error");
+                    yield Err(std::io::Error::other(e));
+                    return;
+                }
+            }
         }
-    }
+
+        let tail = stripper.flush();
+        if !tail.is_empty() {
+            yield Ok(axum::body::Bytes::from(tail));
+        }
+
+        let stripped_count = stripper.stripped_count();
+        if stripped_count > 0 {
+            tracing::info!(
+                request_id = %log_request_id,
+                agent = %log_agent_id,
+                stripped_count = %stripped_count,
+                credentials = ?stripper.stripped_credentials(),
+                "credentials stripped from response"
+            );
+        }
+
+        let scrubbed_count = stripper.scrubbed_count();
+        if scrubbed_count > 0 {
+            tracing::info!(
+                request_id = %log_request_id,
+                agent = %log_agent_id,
+                scrubbed_count = %scrubbed_count,
+                credentials = ?stripper.scrubbed_credentials(),
+                "derived secrets redacted from response (scrub_patterns match)"
+            );
+        }
+
+        tracing::info!(
+            request_id = %log_request_id,
+            agent = %log_agent_id,
+            upstream_status = %resp_status.as_u16(),
+            credentials_injected = %log_injected_count,
+            credentials_stripped = %stripped_count,
+            credentials_scrubbed = %scrubbed_count,
+            "proxy request completed"
+        );
+
+        // Estimate cost and record spend against the charged credential's
+        // budget. Only for provider-prefixed routes (Host-header fallback
+        // routing has no slug, hence no pricing basis) — see
+        // route::RouteTarget::provider_slug.
+        if let Some(slug) = &provider_slug {
+            let usage = if is_sse {
+                cost::sse_usage_from_bytes(&cost_tap)
+            } else {
+                cost::extract_usage_from_json(&cost_tap)
+            }
+            .unwrap_or_else(|| cost::TokenUsage {
+                input_tokens: cost::estimate_tokens_from_bytes(request_body_len),
+                output_tokens: cost::estimate_tokens_from_bytes(total_response_bytes),
+            });
+
+            let model = cost::extract_model_from_json(&cost_tap)
+                .or(request_model)
+                .unwrap_or_else(|| "unknown".to_string());
+            let cost_usd = cost::estimate_cost_usd(slug, &model, usage);
+
+            if let Some(cred) = &charge_credential {
+                let mut bt = budget_tracker.lock().await;
+                bt.record_spend(cred, &log_agent_id, cost_usd);
+            }
+
+            tracing::info!(
+                request_id = %log_request_id,
+                agent = %log_agent_id,
+                provider = %slug,
+                model = %model,
+                input_tokens = %usage.input_tokens,
+                output_tokens = %usage.output_tokens,
+                cost_usd = %format!("{cost_usd:.6}"),
+                "estimated request cost"
+            );
+        }
+    };
 
     response
-        .body(Body::from(stripped_body))
+        .body(Body::from_stream(body_stream))
         .map_err(|e| WardenError::Io(std::io::Error::other(e)))
 }
 
 fn error_response(err: WardenError) -> Response {
     let (status, body) = match &err {
-        WardenError::Unauthorized { agent_id, credential } => (
+        WardenError::Unauthorized {
+            agent_id,
+            credential,
+        } => (
             StatusCode::FORBIDDEN,
             serde_json::json!({
                 "error": "unauthorized",
@@ -295,6 +625,32 @@ fn error_response(err: WardenError) -> Response {
                 "credential": credential,
                 "agent": agent_id,
                 "retry_after_seconds": retry_after_seconds,
+            }),
+        ),
+        WardenError::BudgetExceeded {
+            credential,
+            agent_id,
+            spent_usd,
+            max_usd,
+        } => (
+            StatusCode::PAYMENT_REQUIRED,
+            serde_json::json!({
+                "error": "budget_exceeded",
+                "credential": credential,
+                "agent": agent_id,
+                "spent_usd": spent_usd,
+                "max_usd": max_usd,
+            }),
+        ),
+        WardenError::LoopDetected {
+            agent_id,
+            repeat_count,
+        } => (
+            StatusCode::TOO_MANY_REQUESTS,
+            serde_json::json!({
+                "error": "loop_detected",
+                "agent": agent_id,
+                "repeat_count": repeat_count,
             }),
         ),
         _ => (

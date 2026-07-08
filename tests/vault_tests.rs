@@ -17,6 +17,9 @@ fn test_full_vault_lifecycle() {
                 "OPENAI_KEY",
                 "sk-proj-real-key-123",
                 &CredentialConfig {
+                    scrub_patterns: Vec::new(),
+                    oauth: None,
+                    budget: None,
                     allowed_agents: vec!["researcher".to_string(), "writer".to_string()],
                     allowed_domains: vec!["api.openai.com".to_string()],
                     rate_limit: Some(RateLimitConfig {
@@ -32,6 +35,9 @@ fn test_full_vault_lifecycle() {
                 "ANTHROPIC_KEY",
                 "sk-ant-real-key-456",
                 &CredentialConfig {
+                    scrub_patterns: Vec::new(),
+                    oauth: None,
+                    budget: None,
                     allowed_agents: vec!["researcher".to_string()],
                     allowed_domains: vec!["api.anthropic.com".to_string()],
                     rate_limit: None,
@@ -107,6 +113,9 @@ fn test_domain_authorization() {
             "KEY",
             "secret",
             &CredentialConfig {
+                scrub_patterns: Vec::new(),
+                oauth: None,
+                budget: None,
                 allowed_agents: vec![],
                 allowed_domains: vec!["api.openai.com".to_string()],
                 rate_limit: None,

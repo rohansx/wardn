@@ -25,9 +25,15 @@ async fn main() {
             cli::serve_cmd::run(serve_args, &vault_path, args.config.as_deref()).await
         }
 
+        Commands::Run(run_args) => {
+            cli::run_cmd::run(run_args, &vault_path, args.config.as_deref()).await
+        }
+
         Commands::Migrate(migrate_args) => cli::migrate_cmd::run(migrate_args, &vault_path),
 
         Commands::Setup { command } => cli::setup_cmd::run(command, &vault_path),
+
+        Commands::Budget { command } => cli::budget_cmd::run(command, &vault_path).await,
     };
 
     if let Err(e) = result {

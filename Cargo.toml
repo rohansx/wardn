@@ -33,10 +33,15 @@ axum = "0.8"
 hyper = { version = "1", features = ["full"] }
 hyper-util = { version = "0.1", features = ["tokio", "http1", "http2"] }
 http-body-util = "0.1"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "gzip", "brotli", "deflate", "json"] }
+async-stream = "0.3"
 tower = { version = "0.5", features = ["util"] }
 rmcp = { version = "1", features = ["server", "transport-io", "macros"] }
 schemars = "1"
+url = "2"
+futures-util = "0.3"
+keyring = "4"
+regex = "1"
 
 [features]
 test-fast-kdf = []

@@ -155,7 +155,10 @@ mod tests {
         let result = rl.check("KEY", "agent");
         assert!(result.is_err());
         let retry_after = result.unwrap_err();
-        assert!(retry_after >= 1, "retry_after should be >= 1, got {retry_after}");
+        assert!(
+            retry_after >= 1,
+            "retry_after should be >= 1, got {retry_after}"
+        );
     }
 
     #[test]

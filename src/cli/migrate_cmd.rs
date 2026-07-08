@@ -28,8 +28,7 @@ pub fn run(args: &MigrateArgs, vault_path: &Path) -> Result<()> {
             tracing::warn!("using passphrase from WARDN_PASSPHRASE env var");
             pass
         } else {
-            rpassword::prompt_password("Vault passphrase: ")
-                .context("failed to read passphrase")?
+            rpassword::prompt_password("Vault passphrase: ").context("failed to read passphrase")?
         };
 
         let mut vault = if vault_path.exists() {

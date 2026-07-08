@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use super::encryption::{self, SensitiveBytes};
 use super::placeholder::PlaceholderMap;
-use crate::config::RateLimitConfig;
+use crate::config::{BudgetConfig, OAuthConfig, RateLimitConfig};
 use crate::WardenError;
 
 const MAGIC: &[u8; 4] = b"WDNV";
@@ -19,6 +19,12 @@ pub struct StoredCredential {
     pub allowed_agents: Vec<String>,
     pub allowed_domains: Vec<String>,
     pub rate_limit: Option<RateLimitConfig>,
+    #[serde(default)]
+    pub budget: Option<BudgetConfig>,
+    #[serde(default)]
+    pub oauth: Option<OAuthConfig>,
+    #[serde(default)]
+    pub scrub_patterns: Vec<String>,
     pub created_at: String,
     pub rotated_at: Option<String>,
 }
@@ -46,14 +52,9 @@ impl VaultData {
 /// Bytes 6-21:  Salt (16 bytes)
 /// Bytes 22+:   AES-256-GCM encrypted payload (nonce || ciphertext || tag)
 /// ```
-pub fn save(
-    path: &Path,
-    key: &[u8],
-    salt: &[u8; 16],
-    data: &VaultData,
-) -> crate::Result<()> {
-    let json = serde_json::to_vec(data)
-        .map_err(|e| WardenError::Encryption(format!("serialize: {e}")))?;
+pub fn save(path: &Path, key: &[u8], salt: &[u8; 16], data: &VaultData) -> crate::Result<()> {
+    let json =
+        serde_json::to_vec(data).map_err(|e| WardenError::Encryption(format!("serialize: {e}")))?;
 
     let encrypted = encryption::encrypt(key, &json)?;
 
@@ -71,11 +72,8 @@ pub fn save(
     Ok(())
 }
 
-/// Load and decrypt a vault file. Returns (data, derived_key, salt).
-pub fn load(
-    path: &Path,
-    passphrase: &str,
-) -> crate::Result<(VaultData, SensitiveBytes, [u8; 16])> {
+/// Read + validate the file header, returning (file_data, salt).
+fn read_and_validate_header(path: &Path) -> crate::Result<(Vec<u8>, [u8; 16])> {
     if !path.exists() {
         return Err(WardenError::VaultNotFound {
             path: path.display().to_string(),
@@ -85,19 +83,15 @@ pub fn load(
     let file_data = fs::read(path)?;
 
     if file_data.len() < 22 {
-        return Err(WardenError::InvalidFormat(
-            "file too short".to_string(),
-        ));
+        return Err(WardenError::InvalidFormat("file too short".to_string()));
     }
 
-    // Validate magic
     if &file_data[0..4] != MAGIC {
         return Err(WardenError::InvalidFormat(
             "invalid magic bytes".to_string(),
         ));
     }
 
-    // Validate version
     let version = u16::from_le_bytes([file_data[4], file_data[5]]);
     if version != VERSION {
         return Err(WardenError::InvalidFormat(format!(
@@ -105,20 +99,39 @@ pub fn load(
         )));
     }
 
-    // Extract salt
     let mut salt = [0u8; 16];
     salt.copy_from_slice(&file_data[6..22]);
 
-    // Derive key from passphrase + salt
+    Ok((file_data, salt))
+}
+
+fn decrypt_payload(key: &[u8], file_data: &[u8]) -> crate::Result<VaultData> {
+    let decrypted = encryption::decrypt(key, &file_data[22..])?;
+    serde_json::from_slice(&decrypted)
+        .map_err(|e| WardenError::Encryption(format!("deserialize: {e}")))
+}
+
+/// Load and decrypt a vault file. Returns (data, derived_key, salt).
+pub fn load(path: &Path, passphrase: &str) -> crate::Result<(VaultData, SensitiveBytes, [u8; 16])> {
+    let (file_data, salt) = read_and_validate_header(path)?;
     let key = encryption::derive_key(passphrase, &salt)?;
-
-    // Decrypt payload
-    let decrypted = encryption::decrypt(key.expose(), &file_data[22..])?;
-
-    let data: VaultData = serde_json::from_slice(&decrypted)
-        .map_err(|e| WardenError::Encryption(format!("deserialize: {e}")))?;
-
+    let data = decrypt_payload(key.expose(), &file_data)?;
     Ok((data, key, salt))
+}
+
+/// Re-read and decrypt a vault file using an ALREADY-DERIVED key, skipping
+/// the (deliberately slow) Argon2id KDF entirely.
+///
+/// Safe because a vault's salt never changes after `vault create` — the
+/// same passphrase always re-derives the same key for a given file, so an
+/// already-open `Vault` can cheaply pick up changes another process wrote
+/// (e.g. `wardn budget set` while a `wardn serve` daemon is running)
+/// without re-authenticating. This is a cache-invalidation mechanism, not
+/// an alternate auth path — the key must already have been legitimately
+/// derived via `load()` first.
+pub fn reload_with_key(path: &Path, key: &[u8]) -> crate::Result<VaultData> {
+    let (file_data, _salt) = read_and_validate_header(path)?;
+    decrypt_payload(key, &file_data)
 }
 
 /// Load with fast key derivation (for tests).
@@ -140,7 +153,9 @@ pub fn load_fast(
     }
 
     if &file_data[0..4] != MAGIC {
-        return Err(WardenError::InvalidFormat("invalid magic bytes".to_string()));
+        return Err(WardenError::InvalidFormat(
+            "invalid magic bytes".to_string(),
+        ));
     }
 
     let version = u16::from_le_bytes([file_data[4], file_data[5]]);
@@ -190,11 +205,43 @@ mod tests {
                 allowed_agents: vec!["researcher".to_string()],
                 allowed_domains: vec!["api.openai.com".to_string()],
                 rate_limit: None,
+                budget: None,
+                oauth: None,
+                scrub_patterns: Vec::new(),
                 created_at: "2026-03-25T00:00:00Z".to_string(),
                 rotated_at: None,
             },
         );
         data
+    }
+
+    #[test]
+    fn test_reload_with_key_sees_changes_written_by_another_load() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("vault.enc");
+        let data = test_vault_data();
+
+        let (key, salt) = save_with_fast_key(&path, "test-pass", &data).unwrap();
+
+        // Simulate another process opening the same vault and writing a
+        // change — reload_with_key must see it without re-deriving the key.
+        let mut changed = test_vault_data();
+        changed.credentials.get_mut("OPENAI_KEY").unwrap().value = "sk-proj-CHANGED".to_string();
+        save(&path, key.expose(), &salt, &changed).unwrap();
+
+        let reloaded = reload_with_key(&path, key.expose()).unwrap();
+        assert_eq!(reloaded.credentials["OPENAI_KEY"].value, "sk-proj-CHANGED");
+    }
+
+    #[test]
+    fn test_reload_with_key_wrong_key_fails() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("vault.enc");
+        let data = test_vault_data();
+        save_with_fast_key(&path, "test-pass", &data).unwrap();
+
+        let wrong_key = vec![0u8; 32];
+        assert!(reload_with_key(&path, &wrong_key).is_err());
     }
 
     #[test]
@@ -212,6 +259,24 @@ mod tests {
             loaded.credentials["OPENAI_KEY"].value,
             "sk-proj-test-key-123"
         );
+    }
+
+    #[test]
+    fn test_stored_credential_without_budget_field_deserializes() {
+        // Vault files written before the budget field existed have no
+        // "budget" key at all in their JSON — #[serde(default)] must make
+        // this still load cleanly rather than failing to open the vault.
+        let json = r#"{
+            "value": "sk-proj-old-key",
+            "allowed_agents": [],
+            "allowed_domains": [],
+            "rate_limit": null,
+            "created_at": "2026-03-25T00:00:00Z",
+            "rotated_at": null
+        }"#;
+        let cred: StoredCredential = serde_json::from_str(json).unwrap();
+        assert!(cred.budget.is_none());
+        assert_eq!(cred.value, "sk-proj-old-key");
     }
 
     #[test]

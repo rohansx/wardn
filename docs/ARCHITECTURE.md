@@ -28,24 +28,44 @@ Agent → api.openai.com:
 wardn/
 ├── src/
 │   ├── lib.rs              # Public API, WardenError, re-exports
-│   ├── config.rs           # TOML config parsing
+│   ├── config.rs           # TOML config parsing, [upstreams] map
+│   ├── cli/
+│   │   ├── mod.rs          # Clap argument definitions
+│   │   ├── run_cmd.rs      # `wardn run` — lazy-starts the daemon, wires
+│   │   │                   #   agent env vars, execs the child
+│   │   ├── serve_cmd.rs    # `wardn serve`
+│   │   ├── setup_cmd.rs    # `wardn setup claude-code|cursor`
+│   │   ├── vault_cmd.rs    # `wardn vault ...`
+│   │   └── migrate_cmd.rs  # `wardn migrate`
 │   ├── vault/
 │   │   ├── mod.rs          # Vault struct, CRUD operations
 │   │   ├── encryption.rs   # AES-256-GCM, Argon2id, SensitiveString/Bytes
 │   │   ├── storage.rs      # On-disk format, atomic save/load
-│   │   └── placeholder.rs  # Token generation, bidirectional maps
+│   │   ├── placeholder.rs  # Token generation, bidirectional maps
+│   │   └── keyring_store.rs # OS keychain passphrase storage (bounded-timeout)
 │   ├── proxy/
 │   │   ├── mod.rs          # HTTP proxy server (axum)
+│   │   ├── route.rs        # Provider-prefix vs Host-header upstream routing
 │   │   ├── inject.rs       # Credential injection into requests
-│   │   ├── strip.rs        # Credential stripping from responses
+│   │   ├── strip.rs        # Credential stripping (shared pair-building)
+│   │   ├── stream.rs       # Streaming (SSE/chunked) credential stripper
 │   │   └── rate_limit.rs   # Token bucket rate limiter
-│   └── mcp/
-│       ├── mod.rs          # MCP server
-│       └── tools.rs        # MCP tool definitions
+│   ├── mcp/
+│   │   ├── mod.rs          # MCP server
+│   │   └── tools.rs        # MCP tool definitions
+│   ├── migrate/
+│   │   ├── mod.rs
+│   │   └── scanners/credentials.rs
+│   └── daemon/
+│       └── mod.rs          # Proxy + MCP composed into one process
 └── tests/
-    ├── vault_tests.rs
-    ├── proxy_tests.rs
-    └── integration_tests.rs
+    ├── cli_tests.rs        # CLI integration tests (vault/migrate/serve)
+    ├── vault_tests.rs      # Vault lifecycle integration tests
+    ├── proxy_tests.rs      # Proxy tests without a real upstream
+    ├── proxy_e2e_tests.rs  # Real upstream via wiremock: header/body/SSE
+    │                       #   injection and stripping, routing
+    └── run_cmd_tests.rs    # Real end-to-end `wardn run`: daemon lazy-start
+                             #   + child env var wiring
 ```
 
 ## Encryption

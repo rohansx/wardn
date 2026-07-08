@@ -8,30 +8,81 @@ pub struct InjectionResult {
     pub injected: Vec<String>,
 }
 
+const PLACEHOLDER_PREFIX: &str = "wdn_placeholder_";
+const PLACEHOLDER_HEX_LEN: usize = 16;
+
+/// A candidate placeholder token found while scanning text.
+struct PlaceholderMatch {
+    /// Byte offset where the prefix starts.
+    start: usize,
+    /// Byte offset to resume scanning from after this match.
+    resume_from: usize,
+    /// The full token text, only set when exactly `PLACEHOLDER_HEX_LEN`
+    /// valid hex characters followed the prefix.
+    token: Option<String>,
+}
+
+/// Find the next placeholder-shaped span starting at or after `from`.
+///
+/// Unlike a fixed-width slice, this only consumes as many hex characters as
+/// are actually present (up to 16). A truncated or malformed candidate does
+/// not abort the scan — it just resumes right after the prefix, so a
+/// well-formed token later in the same buffer is still found.
+fn find_next_placeholder(haystack: &str, from: usize) -> Option<PlaceholderMatch> {
+    let rel_start = haystack[from..].find(PLACEHOLDER_PREFIX)?;
+    let start = from + rel_start;
+    let hex_start = start + PLACEHOLDER_PREFIX.len();
+
+    let hex_len = haystack[hex_start..]
+        .bytes()
+        .take(PLACEHOLDER_HEX_LEN)
+        .take_while(|b| b.is_ascii_hexdigit())
+        .count();
+
+    if hex_len == PLACEHOLDER_HEX_LEN {
+        let end = hex_start + PLACEHOLDER_HEX_LEN;
+        Some(PlaceholderMatch {
+            start,
+            resume_from: end,
+            token: Some(haystack[start..end].to_string()),
+        })
+    } else {
+        // Malformed/truncated candidate — resume right after the prefix so
+        // we don't skip over a real token embedded further in this span.
+        Some(PlaceholderMatch {
+            start,
+            resume_from: hex_start,
+            token: None,
+        })
+    }
+}
+
 /// Scan a header value for placeholder tokens and replace with real credentials.
 /// Returns the replaced value and list of injected credential names.
+///
+/// Only injects a placeholder that was actually issued to `agent_id` — see
+/// `Vault::resolve_placeholder_for_agent`. A placeholder presented under a
+/// different claimed agent (e.g. stolen and replayed with a spoofed
+/// `x-warden-agent` header) is treated as unknown, same as any other
+/// unrecognized token.
 pub fn inject_header_value(
     value: &str,
-    _agent_id: &str,
+    agent_id: &str,
     domain: &str,
     vault: &Vault,
 ) -> crate::Result<(String, Vec<String>)> {
     let mut result = value.to_string();
     let mut injected = Vec::new();
 
-    // Find all wdn_placeholder_ tokens in the value
     let mut search_from = 0;
-    while let Some(start) = result[search_from..].find("wdn_placeholder_") {
-        let abs_start = search_from + start;
-        // Token is "wdn_placeholder_" + 16 hex chars = 32 chars total
-        let abs_end = abs_start + 32;
-        if abs_end > result.len() {
-            break;
-        }
+    while let Some(m) = find_next_placeholder(&result, search_from) {
+        let Some(token) = m.token else {
+            search_from = m.resume_from;
+            continue;
+        };
 
-        let token = &result[abs_start..abs_end].to_string();
-
-        if let Some((cred_name, cred_value)) = vault.resolve_placeholder(token) {
+        if let Some((cred_name, cred_value)) = vault.resolve_placeholder_for_agent(&token, agent_id)
+        {
             // Check domain authorization
             if !vault.is_domain_allowed(cred_name, domain) {
                 return Err(WardenError::DomainNotAllowed {
@@ -43,16 +94,16 @@ pub fn inject_header_value(
             let real_value = cred_value.expose().to_string();
             result = format!(
                 "{}{}{}",
-                &result[..abs_start],
+                &result[..m.start],
                 real_value,
-                &result[abs_end..]
+                &result[m.resume_from..]
             );
             injected.push(cred_name.to_string());
             // Advance past the injected value
-            search_from = abs_start + real_value.len();
+            search_from = m.start + real_value.len();
         } else {
             // Unknown placeholder — skip past it
-            search_from = abs_end;
+            search_from = m.resume_from;
         }
     }
 
@@ -87,6 +138,9 @@ mod tests {
                 "OPENAI_KEY",
                 "sk-proj-real-key-123",
                 &CredentialConfig {
+                    scrub_patterns: Vec::new(),
+                    oauth: None,
+                    budget: None,
                     allowed_agents: vec!["researcher".to_string()],
                     allowed_domains: vec!["api.openai.com".to_string()],
                     rate_limit: None,
@@ -94,9 +148,7 @@ mod tests {
             )
             .unwrap();
 
-        let placeholder = vault
-            .get_placeholder("OPENAI_KEY", "researcher")
-            .unwrap();
+        let placeholder = vault.get_placeholder("OPENAI_KEY", "researcher").unwrap();
         (vault, placeholder.to_string())
     }
 
@@ -124,6 +176,25 @@ mod tests {
         assert!(result_str.contains("sk-proj-real-key-123"));
         assert!(!result_str.contains("wdn_placeholder_"));
         assert_eq!(injected, vec!["OPENAI_KEY"]);
+    }
+
+    #[test]
+    fn test_inject_stolen_placeholder_under_spoofed_agent_is_not_injected() {
+        // setup_vault() issues the placeholder to "researcher". A process
+        // presenting that same token but claiming to be a different agent
+        // (e.g. a spoofed x-warden-agent header after the token leaked)
+        // must NOT get the real key — same treatment as an unknown token.
+        let (vault, ph) = setup_vault();
+        let header = format!("Bearer {ph}");
+
+        let (result, injected) =
+            inject_header_value(&header, "attacker", "api.openai.com", &vault).unwrap();
+
+        assert_eq!(
+            result, header,
+            "real key must not be injected for a mismatched agent claim"
+        );
+        assert!(injected.is_empty());
     }
 
     #[test]
@@ -167,6 +238,9 @@ mod tests {
                 "KEY_A",
                 "secret-a",
                 &CredentialConfig {
+                    scrub_patterns: Vec::new(),
+                    oauth: None,
+                    budget: None,
                     allowed_agents: vec![],
                     allowed_domains: vec![],
                     rate_limit: None,
@@ -178,6 +252,9 @@ mod tests {
                 "KEY_B",
                 "secret-b",
                 &CredentialConfig {
+                    scrub_patterns: Vec::new(),
+                    oauth: None,
+                    budget: None,
                     allowed_agents: vec![],
                     allowed_domains: vec![],
                     rate_limit: None,
@@ -189,8 +266,7 @@ mod tests {
         let ph_b = vault.get_placeholder("KEY_B", "agent").unwrap().to_string();
 
         let body = format!(r#"{{"a": "{ph_a}", "b": "{ph_b}"}}"#);
-        let (result, injected) =
-            inject_body(body.as_bytes(), "agent", "any.com", &vault).unwrap();
+        let (result, injected) = inject_body(body.as_bytes(), "agent", "any.com", &vault).unwrap();
 
         let result_str = String::from_utf8(result).unwrap();
         assert!(result_str.contains("secret-a"));
@@ -209,5 +285,46 @@ mod tests {
 
         assert_eq!(result, binary);
         assert!(injected.is_empty());
+    }
+
+    #[test]
+    fn test_inject_truncated_token_does_not_abort_scan() {
+        // A malformed/truncated "wdn_placeholder_" candidate earlier in the
+        // buffer must not stop the scanner from finding a real, well-formed
+        // token later in the same buffer.
+        let (vault, ph) = setup_vault();
+        let body = format!("wdn_placeholder_abc garbage then {ph} at the end");
+
+        let (result, injected) =
+            inject_header_value(&body, "researcher", "api.openai.com", &vault).unwrap();
+
+        assert!(result.contains("sk-proj-real-key-123"));
+        assert_eq!(injected, vec!["OPENAI_KEY"]);
+    }
+
+    #[test]
+    fn test_inject_token_at_exact_buffer_end() {
+        let (vault, ph) = setup_vault();
+        let body = format!("Bearer {ph}");
+
+        let (result, injected) =
+            inject_header_value(&body, "researcher", "api.openai.com", &vault).unwrap();
+
+        assert_eq!(result, "Bearer sk-proj-real-key-123");
+        assert_eq!(injected, vec!["OPENAI_KEY"]);
+    }
+
+    #[test]
+    fn test_inject_non_hex_after_prefix_does_not_swallow_next_token() {
+        // Garbage right after the prefix (not 16 valid hex chars) should not
+        // cause the scanner to jump past a legitimate token that follows.
+        let (vault, ph) = setup_vault();
+        let body = format!("wdn_placeholder_not-hex-at-all {ph}");
+
+        let (result, injected) =
+            inject_header_value(&body, "researcher", "api.openai.com", &vault).unwrap();
+
+        assert!(result.contains("sk-proj-real-key-123"));
+        assert_eq!(injected, vec!["OPENAI_KEY"]);
     }
 }
