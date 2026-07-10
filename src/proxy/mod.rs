@@ -1,5 +1,7 @@
+pub mod audit;
 pub mod budget;
 pub mod cost;
+pub mod dashboard;
 pub mod inject;
 pub mod loop_guard;
 pub mod oauth;
@@ -9,12 +11,13 @@ pub mod stream;
 pub mod strip;
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use axum::body::Body;
 use axum::extract::{Query, State};
 use axum::http::{HeaderMap, HeaderValue, Request, StatusCode};
-use axum::response::{IntoResponse, Response};
-use axum::routing::any;
+use axum::response::{IntoResponse, Redirect, Response};
+use axum::routing::{any, get};
 use axum::Router;
 use futures_util::StreamExt;
 use serde::Deserialize;
@@ -23,6 +26,7 @@ use tokio::sync::RwLock;
 use crate::config::WardenConfig;
 use crate::vault::Vault;
 use crate::WardenError;
+use audit::AuditEntry;
 use loop_guard::LoopGuard;
 use rate_limit::RateLimiter;
 use stream::StreamingStripper;
@@ -33,7 +37,11 @@ pub struct ProxyState {
     pub rate_limiter: Arc<tokio::sync::Mutex<RateLimiter>>,
     pub budget_tracker: Arc<tokio::sync::Mutex<budget::BudgetTracker>>,
     pub loop_guard: Arc<tokio::sync::Mutex<LoopGuard>>,
+    pub audit: Arc<std::sync::Mutex<audit::AuditLog>>,
     pub config: WardenConfig,
+    pub host: String,
+    pub port: u16,
+    pub started_at: Instant,
     pub http_client: reqwest::Client,
 }
 
@@ -49,10 +57,41 @@ fn generate_request_id() -> String {
 /// Build the proxy router.
 pub fn build_router(state: Arc<ProxyState>) -> Router {
     Router::new()
-        .route("/health", axum::routing::get(health_handler))
-        .route("/_wardn/budget", axum::routing::get(budget_status_handler))
+        .route("/health", get(health_handler))
+        .route("/_wardn/budget", get(budget_status_handler))
+        // Dashboard routes — registered directly on the main router (NOT
+        // via .nest(), which would add an unwanted prefix). The dashboard
+        // is purely read-only — see src/proxy/dashboard.rs for endpoints.
+        .route("/ui", get(dashboard::ui_handler))
+        .route("/", get(|| async { Redirect::to("/ui") }))
+        .route("/api/summary", get(dashboard::summary_handler))
+        .route("/api/credentials", get(dashboard::credentials_handler))
+        .route(
+            "/api/credentials",
+            axum::routing::post(dashboard::create_credential_handler),
+        )
+        .route(
+            "/api/credentials/{name}/rotate",
+            axum::routing::post(dashboard::rotate_credential_handler),
+        )
+        .route(
+            "/api/credentials/{name}",
+            axum::routing::delete(dashboard::delete_credential_handler),
+        )
+        .route("/api/audit", get(dashboard::audit_handler))
+        .route("/api/budgets", get(dashboard::budgets_handler))
         .fallback(any(proxy_handler))
         .with_state(state)
+}
+
+fn record_audit(state: &ProxyState, entry: AuditEntry) {
+    match state.audit.lock() {
+        Ok(mut log) => log.record(entry),
+        Err(poisoned) => {
+            let mut log = poisoned.into_inner();
+            log.record(entry);
+        }
+    }
 }
 
 async fn health_handler() -> impl IntoResponse {
@@ -115,9 +154,33 @@ async fn budget_status_handler(
 }
 
 async fn proxy_handler(State(state): State<Arc<ProxyState>>, req: Request<Body>) -> Response {
+    // Snapshot the agent identity BEFORE `req` is moved into
+    // handle_proxy_request — we need it to attribute error events to the
+    // right agent in the audit log.
+    let agent_for_audit = req
+        .headers()
+        .get(AGENT_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("anonymous")
+        .to_string();
+    let state_for_error_audit = state.clone();
+
     match handle_proxy_request(state, req).await {
         Ok(response) => response,
         Err(e) => {
+            let event = match &e {
+                WardenError::Unauthorized { .. } => "request_denied",
+                WardenError::DomainNotAllowed { .. } => "domain_denied",
+                _ => "request_error",
+            };
+            // A fresh request_id here — the original id (used inside the
+            // inner handler) is gone with the consumed `req`, and the only
+            // purpose of this row is signalling "this request failed"; the
+            // corresponding tracing event carries the correlated id.
+            record_audit(
+                &state_for_error_audit,
+                AuditEntry::new(generate_request_id(), &agent_for_audit, event),
+            );
             tracing::warn!(error = %e, "proxy request failed");
             error_response(e)
         }
@@ -199,6 +262,11 @@ async fn handle_proxy_request(
                 domain = %domain,
                 path = %path,
                 "loop detected — blocking request"
+            );
+            record_audit(
+                &state,
+                AuditEntry::new(&request_id, &agent_id, "loop_detected")
+                    .request(&method, &domain, &path),
             );
             return Err(WardenError::LoopDetected {
                 agent_id: agent_id.clone(),
@@ -307,6 +375,12 @@ async fn handle_proxy_request(
             domain = %domain,
             "credential injected"
         );
+        record_audit(
+            &state,
+            AuditEntry::new(&request_id, &agent_id, "credential_injected")
+                .credential(cred_name)
+                .request(&method, &domain, &path),
+        );
     }
 
     // 7. Rate limit check for each injected credential
@@ -320,6 +394,12 @@ async fn handle_proxy_request(
                     credential = %cred_name,
                     retry_after_seconds = %retry_after,
                     "rate limit exceeded"
+                );
+                record_audit(
+                    &state,
+                    AuditEntry::new(&request_id, &agent_id, "rate_limit")
+                        .credential(cred_name)
+                        .request(&method, &domain, &path),
                 );
                 return Err(WardenError::RateLimitExceeded {
                     credential: cred_name.clone(),
@@ -352,6 +432,12 @@ async fn handle_proxy_request(
                         max_usd = %max_usd,
                         "budget exceeded (soft mode — allowing request)"
                     );
+                    record_audit(
+                        &state,
+                        AuditEntry::new(&request_id, &agent_id, "budget_exceeded")
+                            .credential(cred_name)
+                            .request(&method, &domain, &path),
+                    );
                 }
                 budget::BudgetCheck::Exceeded { spent_usd, max_usd } => {
                     tracing::warn!(
@@ -361,6 +447,12 @@ async fn handle_proxy_request(
                         spent_usd = %spent_usd,
                         max_usd = %max_usd,
                         "budget exceeded — blocking request"
+                    );
+                    record_audit(
+                        &state,
+                        AuditEntry::new(&request_id, &agent_id, "budget_exceeded")
+                            .credential(cred_name)
+                            .request(&method, &domain, &path),
                     );
                     return Err(WardenError::BudgetExceeded {
                         credential: cred_name.clone(),
@@ -379,7 +471,12 @@ async fn handle_proxy_request(
     // see the routing comment above for why).
     let upstream_url = format!("{}{}", route.upstream_base, route.upstream_path_and_query);
 
-    // 9. Forward request to upstream
+    // 9. Forward request to upstream.
+    // Capture the HTTP method as a string BEFORE the `axum::http::Method`
+    // gets translated/consumed into the reqwest request — the body_stream
+    // audit closure needs `log_method` after the response has fully
+    // arrived and the original `Method` is gone.
+    let log_method = parts.method.to_string();
     let method = match parts.method {
         axum::http::Method::GET => reqwest::Method::GET,
         axum::http::Method::POST => reqwest::Method::POST,
@@ -488,6 +585,10 @@ async fn handle_proxy_request(
         .unwrap_or(false);
     let provider_slug = route.provider_slug.clone();
     let charge_credential = all_injected.first().cloned();
+    let log_domain = domain.clone();
+    let log_path = path.clone();
+    let cost_credential_for_audit = all_injected.first().cloned();
+    let state_for_audit = state.clone();
     let budget_tracker = state.budget_tracker.clone();
 
     let body_stream = async_stream::stream! {
@@ -540,21 +641,11 @@ async fn handle_proxy_request(
             );
         }
 
-        tracing::info!(
-            request_id = %log_request_id,
-            agent = %log_agent_id,
-            upstream_status = %resp_status.as_u16(),
-            credentials_injected = %log_injected_count,
-            credentials_stripped = %stripped_count,
-            credentials_scrubbed = %scrubbed_count,
-            "proxy request completed"
-        );
-
         // Estimate cost and record spend against the charged credential's
         // budget. Only for provider-prefixed routes (Host-header fallback
         // routing has no slug, hence no pricing basis) — see
         // route::RouteTarget::provider_slug.
-        if let Some(slug) = &provider_slug {
+        let cost_usd = if let Some(slug) = &provider_slug {
             let usage = if is_sse {
                 cost::sse_usage_from_bytes(&cost_tap)
             } else {
@@ -568,11 +659,11 @@ async fn handle_proxy_request(
             let model = cost::extract_model_from_json(&cost_tap)
                 .or(request_model)
                 .unwrap_or_else(|| "unknown".to_string());
-            let cost_usd = cost::estimate_cost_usd(slug, &model, usage);
+            let usd = cost::estimate_cost_usd(slug, &model, usage);
 
             if let Some(cred) = &charge_credential {
                 let mut bt = budget_tracker.lock().await;
-                bt.record_spend(cred, &log_agent_id, cost_usd);
+                bt.record_spend(cred, &log_agent_id, usd);
             }
 
             tracing::info!(
@@ -582,10 +673,39 @@ async fn handle_proxy_request(
                 model = %model,
                 input_tokens = %usage.input_tokens,
                 output_tokens = %usage.output_tokens,
-                cost_usd = %format!("{cost_usd:.6}"),
+                cost_usd = %format!("{usd:.6}"),
                 "estimated request cost"
             );
+            Some(usd)
+        } else {
+            None
+        };
+
+        tracing::info!(
+            request_id = %log_request_id,
+            agent = %log_agent_id,
+            upstream_status = %resp_status.as_u16(),
+            credentials_injected = %log_injected_count,
+            credentials_stripped = %stripped_count,
+            credentials_scrubbed = %scrubbed_count,
+            "proxy request completed"
+        );
+
+        // Final dashboard audit entry: one record per successfully proxied
+        // request. Errored requests are visible via tracing (and via the
+        // loop/budget/rate_limit entries already recorded earlier in this
+        // handler), but this single "request_completed" row is what the
+        // dashboard's recent-activity table is built around.
+        let mut entry = AuditEntry::new(&log_request_id, &log_agent_id, "request_completed")
+            .request(&log_method, &log_domain, &log_path)
+            .status(resp_status.as_u16());
+        if let Some(c) = &cost_credential_for_audit {
+            entry = entry.credential(c);
         }
+        if let Some(usd) = cost_usd {
+            entry = entry.cost(usd);
+        }
+        record_audit(&state_for_audit, entry);
     };
 
     response

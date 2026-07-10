@@ -1,4 +1,5 @@
 pub mod budget_cmd;
+pub mod import_cmd;
 pub mod migrate_cmd;
 pub mod run_cmd;
 pub mod serve_cmd;
@@ -57,6 +58,12 @@ pub enum Commands {
 
     /// Scan for exposed credentials and migrate them
     Migrate(MigrateArgs),
+
+    /// Import credentials into the vault from external sources
+    Import {
+        #[command(subcommand)]
+        command: ImportCommands,
+    },
 
     /// Set up wardn integration with AI tools
     Setup {
@@ -179,6 +186,41 @@ pub enum MigrateSourceArg {
     ClaudeCode,
     OpenClaw,
     Directory,
+}
+
+#[derive(Subcommand)]
+pub enum ImportCommands {
+    /// Parse a classic .env file (KEY=value, comments, optional `export`,
+    /// single/double-quoted values with backslash escapes).
+    Dotenv {
+        /// Path to the .env file
+        path: PathBuf,
+    },
+
+    /// Import credentials from a JSON or YAML file. Format: either a flat
+    /// `{KEY: value}` map or a structured `{credentials: [{name, value}, ...]}`.
+    /// Format is inferred from extension (`.json`, `.yaml`, `.yml`).
+    File {
+        /// Path to the JSON or YAML file
+        path: PathBuf,
+    },
+
+    /// Import credentials from 1Password via the `op` CLI. Reuses your
+    /// signed-in `op` session; runs `op read <REF>` and stores the result.
+    /// Default name is derived from the ref's last segment; override with --name.
+    OnePassword {
+        /// `op://vault/item/field` reference
+        #[arg(value_name = "REF")]
+        ref_arg: String,
+
+        /// Override the credential name (otherwise derived from the ref)
+        #[arg(long)]
+        name: Option<String>,
+    },
+
+    /// Read .env-formatted KEY=value lines from stdin. Useful for piping:
+    ///   echo 'OPENAI_KEY=sk-...' | wardn import stdin
+    Stdin,
 }
 
 #[derive(Subcommand)]

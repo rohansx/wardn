@@ -31,6 +31,8 @@ async fn main() {
 
         Commands::Migrate(migrate_args) => cli::migrate_cmd::run(migrate_args, &vault_path),
 
+        Commands::Import { command } => cli::import_cmd::run(command, &vault_path),
+
         Commands::Setup { command } => cli::setup_cmd::run(command, &vault_path),
 
         Commands::Budget { command } => cli::budget_cmd::run(command, &vault_path).await,

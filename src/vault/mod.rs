@@ -194,6 +194,13 @@ impl Vault {
         self.credentials.get(name).map(|e| &e.value)
     }
 
+    /// Path this vault was opened from, or None for an ephemeral (in-memory
+    /// only) vault. Useful for surfacing the active vault in dashboard UIs
+    /// without re-asking the caller for the path.
+    pub fn path(&self) -> Option<&Path> {
+        self.path.as_deref()
+    }
+
     /// List all credentials (names + metadata, no values).
     pub fn list(&self) -> Vec<CredentialInfo> {
         self.credentials

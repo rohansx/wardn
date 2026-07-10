@@ -1,13 +1,42 @@
 # wardn
 
-Credential isolation for AI agents. Agents never see real API keys — structural guarantee, not policy.
+**A credential firewall for AI agents.**
+
+The headline claim is structural, not policy: agents receive placeholder tokens,
+never real API keys. The real key crosses only one network seam — inside the
+wardn proxy, on its way to the upstream API — and is stripped from responses
+before they reach the agent. Logs, environment, LLM context windows, scratch
+files, and shell history hold only placeholders.
+
+```text
+agent process       OPENAI_KEY=wdn_placeholder_a1b2c3d4e5f6g7h8     (useless)
+agent logs          Authorization: Bearer wdn_placeholder_a1b2...     (useless)
+LLM context         wdn_placeholder_a1b2c3d4e5f6g7h8                   (useless)
+wardn proxy         injects the real key in-flight, single seam        (deleted on response)
+~/.vibeguard/vault.enc   AES-256-GCM(Argon2id(passphrase))             (encrypted at rest)
+```
+
+This is the load-bearing claim and it's defensible today against agent
+compromise, prompt injection, log theft, and skill exfiltration.
+Read [docs/THREAT-MODEL.md](docs/THREAT-MODEL.md) for the honest split
+between what is covered and what isn't — including the tier where the
+stronger "host compromise leaks nothing" claim becomes reachable.
+
+The vault itself (encrypted at rest, passphrase-derived key) is a real
+component and the reason the firewall can run on a single machine. The
+upcoming [docs/HOSTED-TIER.md](docs/HOSTED-TIER.md) tier additionally
+wraps the proxy in a confidential-compute enclave so even a fully
+compromised VPS cannot read the key.
 
 [![Crates.io](https://img.shields.io/crates/v/wardn.svg)](https://crates.io/crates/wardn)
 [![License](https://img.shields.io/crates/l/wardn.svg)](LICENSE)
 
 ## The Problem
 
-Every AI agent framework today stores API keys in environment variables or `.env` files. A compromised agent, malicious skill, or commodity stealer gets full access to your credentials.
+Every AI agent framework today stores API keys in environment variables or
+`.env` files. A compromised agent, malicious skill, commodity stealer, or
+prompt injection exfiltrating `Authorization: Bearer sk-...` from an LLM
+log gets full access to your credentials.
 
 ```
 ~/.env              → OPENAI_KEY=sk-proj-real-key      # plaintext, readable by anyone
@@ -15,13 +44,18 @@ agent context       → "Use OPENAI_KEY=sk-proj-real-key" # leaked into LLM cont
 agent logs          → Authorization: Bearer sk-proj-... # sitting in log files
 ```
 
-## The Fix
+## The Fix: A Credential Firewall
 
-Wardn vaults credentials with AES-256-GCM encryption and gives agents useless placeholder tokens. Real keys are injected at the network layer — agents never touch them.
+wardn hands agents a useless placeholder string and removes the real key
+from every surface it can reach. Real keys are injected at the network
+layer — a single seam — and stripped from responses before they reach
+the agent.
 
 ```
 agent environment   → OPENAI_KEY=wdn_placeholder_a1b2c3d4e5f6g7h8   (useless)
-wardn vault         → OPENAI_KEY=sk-proj-real-key                     (encrypted)
+wardn vault         → OPENAI_KEY=sk-proj-real-key                     (encrypted at rest)
+upstream request    → Authorization: Bearer sk-proj-real-key          (network transit only)
+upstream response   → ...real keys stripped, placeholders returned... (re-injected on the way back)
 agent logs          → Authorization: Bearer wdn_placeholder_a1b2...   (useless)
 LLM context window  → wdn_placeholder_a1b2c3d4e5f6g7h8               (useless)
 ```
@@ -111,6 +145,22 @@ Agent sends request with placeholder in Authorization header
   <img src="demo/wardn-demo.gif" alt="wardn demo" width="800">
 </p>
 
+## Trust Levels, Honest
+
+| Tier | Where | What holds |
+|---|---|---|
+| **Self-host (today)** | your laptop, your VPS, CI | Encrypted-at-rest vault, firewall claim against agents. **Does not** defend against root on the host. |
+| **Hosted (upcoming)** | wardn-managed or BYO-cloud | Confidential-compute enclave (Nitro / SEV-SNP) + remote attestation + encrypt-to-the-proxy flow. Real "host compromise leaks nothing" claim. |
+
+The self-host tier is the load-bearing claim and ships today. The hosted tier
+is the strict-upgrade path: it costs money and operational complexity, and
+its design is in [docs/HOSTED-TIER.md](docs/HOSTED-TIER.md). Full honest
+inventory of what is and isn't covered:
+
+👉 **[docs/THREAT-MODEL.md](docs/THREAT-MODEL.md)** — covers / does-not-cover
+table, "no software vault eliminates host compromise" called out plainly, and
+the upgrade path.
+
 ## Install
 
 ```bash
@@ -146,6 +196,30 @@ That's it. Claude Code now uses wardn's MCP server to get placeholder tokens ins
 4. Proxy strips real key from response before returning to agent
 
 The real key never enters the agent's memory, logs, or LLM context window.
+
+## Local Dashboard
+
+Once the daemon is up (`wardn serve`, or spawned by `wardn run`), open
+**http://127.0.0.1:7777/ui** in a browser. A read-only, local-only view of:
+
+- **Credentials** — every stored credential with its ACLs (allowed agents,
+  allowed domains, rate limit + budget badges).
+- **Recent Activity** — the last 50 proxy events with method, domain,
+  path, status, agent, request_id, and recorded cost (`request_completed`,
+  `credential_injected`, `rate_limit`, `budget_exceeded`, `loop_detected`,
+  `request_error`).
+- **Budgets** — every credential's configured budget (max, spent,
+  remaining, window, mode) with a progress bar that turns warn → bad as
+  it crosses 50% / 80%.
+
+Polled automatically every 2 s. No mutation endpoints — the only way
+out of the dashboard is the API itself (`/api/summary`, `/api/credentials`,
+`/api/audit?limit=N`, `/api/budgets`).
+
+```bash
+# Static, anonymous, never sees real keys
+curl http://127.0.0.1:7777/api/summary | jq
+```
 
 ### Manual setup
 
@@ -240,6 +314,32 @@ wardn migrate --source claude-code                  # scan + migrate to vault
 wardn migrate --source open-claw                    # scan OpenClaw config
 wardn migrate --source directory --path ./my-proj   # scan any directory
 ```
+
+### Importing Credentials
+
+```bash
+# Classic .env file (KEY=value, comments, optional `export`, quoted values
+# with backslash escapes honored)
+wardn import dotenv ./.env
+
+# JSON or YAML file. Format inferred from extension; either a flat map
+# or a structured {credentials: [{name, value}, ...]} shape.
+wardn import file ./creds.json
+wardn import file ./creds.yaml
+
+# 1Password CLI — reuses your signed-in `op` session. Default name is
+# derived from the ref's last segment; override with --name.
+wardn import one-password op://Personal/openai/api_key
+wardn import one-password op://Work/anthropic/token --name ANTHROPIC_KEY
+
+# stdin — read .env-format lines. Useful for piping.
+echo 'OPENAI_KEY=sk-...' | wardn import stdin
+```
+
+Each importer prompts for the vault passphrase on first use (or reads it
+from `WARDN_PASSPHRASE` / the OS keychain). Existing values are silently
+overwritten — the importer is value-only, metadata (allowed agents /
+domains / rate limit / budget) is preserved.
 
 ### Automation
 

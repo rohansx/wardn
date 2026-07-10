@@ -1,0 +1,1151 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>wardn</title>
+<script>
+  // Resolve theme BEFORE the body parses so there's no FOUC flash.
+  // localStorage wins; falls through to OS prefers-color-scheme.
+  (function () {
+    try {
+      var saved = localStorage.getItem("wardn.theme");
+      if (saved === "light" || saved === "dark") {
+        document.documentElement.dataset.theme = saved;
+      } else if (window.matchMedia &&
+                 window.matchMedia("(prefers-color-scheme: light)").matches) {
+        document.documentElement.dataset.theme = "light";
+      }
+    } catch (_) { /* localStorage blocked, no-op */ }
+  })();
+</script>
+<style>
+  /* Default dark — chosen before any JS runs so there's no FOUC. JS
+     below sets data-theme on <html> based on localStorage / OS pref. */
+  :root {
+    --bg: #14171a;
+    --panel: #161a20;
+    --panel-hover: #1c2024;
+    --border: #232830;
+    --border-strong: #353b42;
+    --text: #c8ccd1;
+    --text-strong: #ebedef;
+    --muted: #707075;
+    --dim: #54585e;
+    --accent: #b08a3e;
+    --accent-dim: #7e6430;
+    --warn: #d4a017;
+    --bad: #c44a4a;
+    --good: #6a8f6a;
+  }
+
+  /* Light — warm off-white, not stark. Same hue family as dark so the
+     switch feels like "same document, different paper". */
+  :root[data-theme="light"] {
+    --bg: #f6f4ef;
+    --panel: #ffffff;
+    --panel-hover: #ece9e0;
+    --border: #d9d6cc;
+    --border-strong: #b7b3a8;
+    --text: #28261f;
+    --text-strong: #14130f;
+    --muted: #6c6a64;
+    --dim: #9c9a92;
+    --accent: #6b5418;
+    --accent-dim: #4a3a10;
+    --warn: #8a6500;
+    --bad: #a8302f;
+    --good: #4a754a;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font: 13px/1.5 ui-monospace, SFMono-Regular, "SF Mono", Menlo,
+                       Consolas, "Liberation Mono", monospace;
+    font-feature-settings: "tnum" 1, "ss01" 0;
+    -webkit-font-smoothing: antialiased;
+  }
+  a { color: inherit; text-decoration: none; }
+  button { font: inherit; color: inherit; background: none; border: 0; padding: 0; cursor: pointer; }
+  input, textarea { font: inherit; color: inherit; }
+
+  /* ─── layout ──────────────────────────────────────────────────────────── */
+  .frame {
+    max-width: 1180px;
+    margin: 0 auto;
+    padding: 0 24px 80px;
+  }
+
+  /* ─── header ──────────────────────────────────────────────────────────── */
+  header.top {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    padding: 20px 0 12px;
+    border-bottom: 1px solid var(--border);
+  }
+  header.top h1 {
+    margin: 0;
+    font-size: 14px;
+    font-weight: 700;
+    color: var(--text-strong);
+    letter-spacing: 0.04em;
+  }
+  header.top h1 .dot {
+    display: inline-block;
+    width: 7px; height: 7px;
+    background: var(--accent);
+    margin-right: 8px;
+    vertical-align: middle;
+  }
+  header.top .vault {
+    color: var(--muted);
+    font-size: 12px;
+  }
+  header.top .vault .label { color: var(--dim); margin-right: 4px; }
+  header.top .header-right {
+    display: flex;
+    align-items: baseline;
+    gap: 16px;
+  }
+  header.top .theme-toggle {
+    color: var(--dim);
+    font-size: 12px;
+    font-family: inherit;
+    padding: 2px 6px;
+    border: 1px solid transparent;
+  }
+  header.top .theme-toggle:hover {
+    color: var(--text-strong);
+    border-color: var(--border);
+  }
+  header.top .theme-toggle:focus-visible {
+    outline: 1px solid var(--accent);
+    outline-offset: 1px;
+  }
+
+  /* tabs row */
+  nav.tabs {
+    display: flex;
+    align-items: center;
+    border-bottom: 1px solid var(--border);
+    padding-top: 8px;
+  }
+  nav.tabs button {
+    padding: 8px 16px 10px;
+    margin-right: 4px;
+    color: var(--muted);
+    border-bottom: 2px solid transparent;
+    transition: color 100ms linear, border-color 100ms linear;
+  }
+  nav.tabs button:hover { color: var(--text); }
+  nav.tabs button.active {
+    color: var(--text-strong);
+    border-bottom-color: var(--accent);
+  }
+  nav.tabs button .count {
+    color: var(--dim);
+    margin-left: 6px;
+    font-size: 11px;
+  }
+  nav.tabs .spacer { flex: 1; }
+  nav.tabs .add {
+    margin: 0 0 6px;
+    padding: 5px 12px;
+    color: var(--text);
+    background: var(--panel);
+    border: 1px solid var(--border);
+  }
+  nav.tabs .add:hover { border-color: var(--border-strong); }
+
+  /* ─── tables ──────────────────────────────────────────────────────────── */
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin-top: 16px;
+  }
+  thead th {
+    text-align: left;
+    font-weight: 400;
+    color: var(--dim);
+    padding: 6px 12px;
+    border-bottom: 1px solid var(--border);
+    font-size: 11px;
+    text-transform: lowercase;
+    letter-spacing: 0.05em;
+  }
+  tbody td {
+    padding: 8px 12px;
+    border-bottom: 1px solid var(--border);
+    vertical-align: top;
+  }
+  tbody tr:hover td { background: var(--panel); }
+  td.name { color: var(--text-strong); }
+  td.muted { color: var(--muted); }
+  td.dim { color: var(--dim); }
+  td .acl {
+    display: inline-block;
+    margin-right: 4px;
+  }
+  td .acl::before { content: "·"; margin-right: 4px; color: var(--dim); }
+  td .acl:first-child::before { content: ""; margin: 0; }
+  td .pill {
+    display: inline-block;
+    padding: 1px 7px;
+    border: 1px solid var(--border-strong);
+    color: var(--muted);
+    font-size: 11px;
+    margin-right: 4px;
+  }
+  td .actions { display: flex; gap: 12px; }
+  td .actions button {
+    color: var(--muted);
+    font-size: 12px;
+  }
+  td .actions button:hover { color: var(--text-strong); }
+  td .actions .danger:hover { color: var(--bad); }
+
+  td .progress {
+    position: relative;
+    height: 8px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    width: 120px;
+    display: inline-block;
+    vertical-align: middle;
+    margin-right: 8px;
+  }
+  td .progress > i {
+    display: block;
+    height: 100%;
+    background: var(--good);
+  }
+  td .progress > i.over-50 { background: var(--warn); }
+  td .progress > i.over-80 { background: var(--bad); }
+
+  /* ─── activity log ────────────────────────────────────────────────────── */
+  pre.log {
+    margin: 16px 0 0;
+    padding: 12px 14px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    color: var(--text);
+    font-size: 12px;
+    line-height: 1.6;
+    white-space: pre;
+    overflow-x: auto;
+    max-height: calc(100vh - 200px);
+    overflow-y: auto;
+  }
+  pre.log .row {
+    display: block;
+  }
+  pre.log .row.warn   { color: var(--warn); }
+  pre.log .row.bad    { color: var(--bad); }
+  pre.log .row.denied { color: var(--bad); }
+  pre.log .row.error  { color: var(--bad); }
+  pre.log .row.success { color: var(--text-strong); }
+  pre.log .ts  { color: var(--dim); }
+  pre.log .st  { display: inline-block; width: 3ch; }
+  pre.log .st.ok  { color: var(--text); }
+  pre.log .st.warn { color: var(--warn); }
+  pre.log .st.bad  { color: var(--bad); }
+  pre.log .mtd { color: var(--muted); }
+  pre.log .dom { color: var(--text); }
+  pre.log .pth { color: var(--muted); }
+  pre.log .agn { color: var(--accent); }
+  pre.log .crd { color: var(--text-strong); }
+  pre.log .cst { color: var(--dim); }
+  pre.log .ev  { color: var(--muted); font-style: italic; }
+  pre.log .empty {
+    color: var(--dim);
+    text-align: center;
+    padding: 20px;
+  }
+
+  /* ─── empty states ────────────────────────────────────────────────────── */
+  .empty-state {
+    color: var(--dim);
+    padding: 48px 0;
+    text-align: center;
+    border: 1px dashed var(--border);
+    margin-top: 16px;
+  }
+  .empty-state .hint { color: var(--muted); margin-top: 6px; font-size: 12px; }
+
+  /* ─── drawer (slide from right) ───────────────────────────────────────── */
+  .scrim {
+    position: fixed;
+    inset: 0;
+    background: rgba(0,0,0,0.45);
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 150ms linear;
+    z-index: 10;
+  }
+  .scrim.open { opacity: 1; pointer-events: auto; }
+
+  .drawer {
+    position: fixed;
+    top: 0; right: 0;
+    height: 100vh;
+    width: 460px;
+    max-width: 100vw;
+    background: var(--panel);
+    border-left: 1px solid var(--border);
+    transform: translateX(100%);
+    transition: transform 150ms ease-out;
+    z-index: 11;
+    display: flex;
+    flex-direction: column;
+  }
+  .drawer.open { transform: translateX(0); }
+  .drawer .head {
+    padding: 14px 20px;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+  .drawer .head h2 {
+    margin: 0;
+    font-size: 13px;
+    font-weight: 700;
+    color: var(--text-strong);
+    letter-spacing: 0.04em;
+  }
+  .drawer .head button {
+    color: var(--muted);
+    font-size: 16px;
+    line-height: 1;
+  }
+  .drawer .head button:hover { color: var(--text-strong); }
+  .drawer form {
+    padding: 20px;
+    flex: 1;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 18px;
+  }
+  .drawer label {
+    display: block;
+    color: var(--text-strong);
+    font-size: 12px;
+    margin-bottom: 6px;
+  }
+  .drawer input[type="text"],
+  .drawer input[type="password"] {
+    width: 100%;
+    padding: 7px 10px;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    color: var(--text-strong);
+  }
+  .drawer input:focus {
+    outline: none;
+    border-color: var(--accent);
+  }
+  .drawer .hint {
+    color: var(--dim);
+    font-size: 11px;
+    margin-top: 4px;
+  }
+  .drawer .field-warn {
+    color: var(--warn);
+    font-size: 11px;
+    margin-top: 4px;
+  }
+  .drawer .field-bad {
+    color: var(--bad);
+    font-size: 11px;
+    margin-top: 4px;
+  }
+  .drawer .field-actions {
+    display: flex;
+    gap: 4px;
+  }
+  .drawer .field-actions button {
+    padding: 7px 10px;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    color: var(--muted);
+    font-size: 11px;
+  }
+  .drawer .field-actions button:hover {
+    color: var(--text-strong);
+    border-color: var(--border-strong);
+  }
+  .drawer .confirm {
+    margin-top: 6px;
+    padding: 10px 12px;
+    border: 1px solid var(--border);
+    background: var(--bg);
+    font-size: 11px;
+    color: var(--muted);
+  }
+  .drawer .confirm .path {
+    color: var(--accent-dim);
+    font-size: 12px;
+    margin-top: 2px;
+  }
+  .drawer .foot {
+    border-top: 1px solid var(--border);
+    padding: 14px 20px;
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+  }
+  .drawer .foot button {
+    padding: 7px 16px;
+    border: 1px solid var(--border);
+    background: var(--bg);
+    color: var(--text);
+  }
+  .drawer .foot button:hover { border-color: var(--border-strong); }
+  .drawer .foot button.primary {
+    background: var(--accent-dim);
+    border-color: var(--accent);
+    color: var(--text-strong);
+  }
+  .drawer .foot button.primary:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+  }
+  .drawer .foot button.primary:hover:not(:disabled) {
+    background: var(--accent);
+    color: var(--bg);
+  }
+  .drawer .err {
+    color: var(--bad);
+    font-size: 12px;
+    padding: 8px 10px;
+    border: 1px solid var(--bad);
+    background: rgba(196, 74, 74, 0.08);
+  }
+  .drawer .ok {
+    color: var(--good);
+    font-size: 12px;
+    padding: 8px 10px;
+    border: 1px solid var(--good);
+    background: rgba(106, 143, 106, 0.08);
+  }
+
+  /* ─── native <dialog> for delete confirm ─────────────────────────────── */
+  dialog.confirm-dialog {
+    background: var(--panel);
+    color: var(--text);
+    border: 1px solid var(--border);
+    padding: 0;
+    width: 420px;
+    max-width: 92vw;
+  }
+  dialog.confirm-dialog::backdrop {
+    background: rgba(0,0,0,0.55);
+  }
+  dialog.confirm-dialog .head {
+    padding: 14px 18px;
+    border-bottom: 1px solid var(--border);
+    font-weight: 700;
+    color: var(--text-strong);
+    letter-spacing: 0.04em;
+  }
+  dialog.confirm-dialog .body {
+    padding: 16px 18px;
+    font-size: 12px;
+    color: var(--muted);
+    line-height: 1.6;
+  }
+  dialog.confirm-dialog .body code {
+    color: var(--bad);
+    background: none;
+  }
+  dialog.confirm-dialog .body input {
+    width: 100%;
+    padding: 7px 10px;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    color: var(--text-strong);
+    margin-top: 8px;
+  }
+  dialog.confirm-dialog .body input:focus {
+    outline: none;
+    border-color: var(--accent);
+  }
+  dialog.confirm-dialog .foot {
+    padding: 12px 18px;
+    border-top: 1px solid var(--border);
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+  }
+  dialog.confirm-dialog .foot button {
+    padding: 7px 16px;
+    border: 1px solid var(--border);
+    background: var(--bg);
+    color: var(--text);
+  }
+  dialog.confirm-dialog .foot button.danger {
+    background: var(--bad);
+    border-color: var(--bad);
+    color: var(--text-strong);
+  }
+  dialog.confirm-dialog .foot button.danger:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+  }
+
+  /* ─── connection status indicator (subtle) ───────────────────────────── */
+  .conn {
+    font-size: 11px;
+    color: var(--dim);
+    margin-left: 12px;
+  }
+  .conn.warn { color: var(--warn); }
+
+  /* keyboard focus visible but quiet */
+  button:focus-visible, input:focus-visible {
+    outline: 1px solid var(--accent);
+    outline-offset: 1px;
+  }
+</style>
+</head>
+<body>
+
+<div class="frame">
+
+  <header class="top">
+    <h1><span class="dot"></span>wardn<span class="conn" id="conn"></span></h1>
+    <div class="header-right">
+      <button id="theme-toggle" class="theme-toggle" type="button" title="toggle light / dark">dark</button>
+      <span class="vault"><span class="label">vault</span><span id="vault-path">—</span></span>
+    </div>
+  </header>
+
+  <nav class="tabs">
+    <button data-tab="credentials" class="active">credentials<span class="count" id="cred-count"></span></button>
+    <button data-tab="activity">activity<span class="count" id="audit-count"></span></button>
+    <button data-tab="budgets">budgets<span class="count" id="budget-count"></span></button>
+    <span class="spacer"></span>
+    <button class="add" id="add-btn">+ add credential</button>
+  </nav>
+
+  <!-- Credentials tab -->
+  <section id="tab-credentials">
+    <table>
+      <thead>
+        <tr>
+          <th style="width:24%">name</th>
+          <th style="width:18%">agents</th>
+          <th style="width:24%">domains</th>
+          <th style="width:14%">flags</th>
+          <th style="width:10%">age</th>
+          <th style="width:10%">actions</th>
+        </tr>
+      </thead>
+      <tbody id="cred-tbody">
+        <tr><td colspan="6" class="empty-state">loading…</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- Activity tab -->
+  <section id="tab-activity" hidden>
+    <pre class="log" id="log"><span class="empty">no events yet</span></pre>
+  </section>
+
+  <!-- Budgets tab -->
+  <section id="tab-budgets" hidden>
+    <table>
+      <thead>
+        <tr>
+          <th style="width:22%">credential</th>
+          <th style="width:14%">max</th>
+          <th style="width:14%">spent</th>
+          <th style="width:36%">progress</th>
+          <th style="width:10%">window</th>
+          <th style="width:8%">mode</th>
+        </tr>
+      </thead>
+      <tbody id="budget-tbody">
+        <tr><td colspan="6" class="empty-state">no budgets configured</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+</div>
+
+<!-- Add / rotate drawer -->
+<div class="scrim" id="scrim"></div>
+<aside class="drawer" id="drawer" aria-hidden="true">
+  <div class="head">
+    <h2 id="drawer-title">add credential</h2>
+    <button id="drawer-close" aria-label="close">×</button>
+  </div>
+  <form id="cred-form">
+    <!-- name -->
+    <div>
+      <label for="f-name">name</label>
+      <input type="text" id="f-name" autocomplete="off" spellcheck="false"
+             placeholder="OPENAI_KEY" required>
+      <div class="hint" id="f-name-hint">SCREAMING_SNAKE_CASE · this is the env-var key agents see</div>
+      <div class="field-bad" id="f-name-err" hidden></div>
+    </div>
+
+    <!-- value -->
+    <div>
+      <label for="f-value">value</label>
+      <input type="password" id="f-value" autocomplete="off" spellcheck="false"
+             placeholder="paste or type the secret" required>
+      <div class="field-actions" style="margin-top:6px">
+        <button type="button" id="reveal">show</button>
+        <button type="button" id="paste-from-clip">paste</button>
+      </div>
+      <div class="hint">never logged, never echoed, never displayed by the proxy</div>
+      <div class="field-bad" id="f-value-err" hidden></div>
+    </div>
+
+    <!-- domains -->
+    <div>
+      <label for="f-domains">allowed domains</label>
+      <input type="text" id="f-domains" autocomplete="off" spellcheck="false"
+             placeholder="api.openai.com, api.anthropic.com">
+      <div class="hint">comma-separated · empty means <em>any</em> domain</div>
+    </div>
+
+    <!-- confirm box -->
+    <div class="confirm">
+      storing creates/updates this credential in
+      <div class="path" id="confirm-path">~/.vibeguard/vault.enc</div>
+      the value above is encrypted (AES-256-GCM) before being written to disk.
+      <div class="field-warn" id="overwrite-warn" hidden></div>
+    </div>
+
+    <div id="form-err" class="err" hidden></div>
+    <div id="form-ok"  class="ok"  hidden></div>
+
+    <div class="foot">
+      <button type="button" id="cancel-btn">cancel</button>
+      <button type="submit" class="primary" id="submit-btn">store</button>
+    </div>
+  </form>
+</aside>
+
+<!-- Delete confirmation dialog (native <dialog>) -->
+<dialog class="confirm-dialog" id="del-dialog">
+  <div class="head" id="del-head">delete credential</div>
+  <div class="body">
+    <p>removing <code id="del-name"></code> deletes the encrypted value AND all its placeholders. agents using a placeholder for this credential will start returning <code>401</code> on their next request. this cannot be undone.</p>
+    <p>type <code id="del-name-2"></code> to confirm:</p>
+    <input type="text" id="del-input" autocomplete="off" spellcheck="false">
+  </div>
+  <div class="foot">
+    <button id="del-cancel">cancel</button>
+    <button id="del-confirm" class="danger" disabled>delete</button>
+  </div>
+</dialog>
+
+<script>
+(function () {
+  "use strict";
+
+  // ─── theme toggle ──────────────────────────────────────────────────────
+  // Early-load script in <head> already set data-theme on <html>; here
+  // we only need to handle the click and keep the label in sync.
+  var themeBtn = document.getElementById("theme-toggle");
+  function syncThemeLabel() {
+    var cur = document.documentElement.dataset.theme === "light" ? "light" : "dark";
+    themeBtn.textContent = cur === "light" ? "dark" : "light";
+    themeBtn.setAttribute("aria-pressed", cur === "light" ? "true" : "false");
+  }
+  if (themeBtn) {
+    syncThemeLabel();
+    themeBtn.addEventListener("click", function () {
+      var next = document.documentElement.dataset.theme === "light" ? "dark" : "light";
+      document.documentElement.dataset.theme = next;
+      try { localStorage.setItem("wardn.theme", next); } catch (_) {}
+      syncThemeLabel();
+    });
+  }
+
+  // ─── tiny DOM helper ──────────────────────────────────────────────────
+  function $(sel, root) { return (root || document).querySelector(sel); }
+  function $$(sel, root) { return Array.from((root || document).querySelectorAll(sel)); }
+
+  function esc(s) {
+    return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) {
+      return ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;", "'":"&#39;" })[c];
+    });
+  }
+  function fmtPct(spent, max) {
+    if (!max) return "0%";
+    var p = Math.min(100, (spent / max) * 100);
+    return p.toFixed(1) + "%";
+  }
+  function fmtUsd(n) {
+    if (n == null) return "—";
+    if (Math.abs(n) < 0.01) return "$" + Number(n).toFixed(6);
+    return "$" + Number(n).toFixed(4);
+  }
+  function fmtAge(iso) {
+    if (!iso) return "—";
+    var dt = (Date.now() - Date.parse(iso)) / 1000;
+    if (isNaN(dt) || dt < 0) return "—";
+    if (dt < 60)    return Math.floor(dt) + "s";
+    if (dt < 3600)  return Math.floor(dt / 60) + "m";
+    if (dt < 86400) return Math.floor(dt / 3600) + "h";
+    return Math.floor(dt / 86400) + "d";
+  }
+  function fmtTs(iso) {
+    var d = iso ? new Date(iso) : new Date();
+    function pad(n) { return String(n).padStart(2,"0"); }
+    return pad(d.getHours()) + ":" + pad(d.getMinutes()) + ":" + pad(d.getSeconds());
+  }
+  function methodOf(ev) {
+    if (ev === "request_completed" || ev === "credential_injected") return "OK";
+    if (ev === "rate_limit")      return "429";
+    if (ev === "budget_exceeded") return "402";
+    if (ev === "loop_detected")   return "L∞P";
+    if (ev === "request_denied")  return "403";
+    if (ev === "domain_denied")   return "403";
+    if (ev === "request_error")   return "ERR";
+    if (ev === "credential_created") return "NEW";
+    if (ev === "credential_rotated") return "ROT";
+    if (ev === "credential_deleted") return "DEL";
+    // last segment, upper-cased, for any event we don't special-case
+    var seg = ev.split("_").pop();
+    return seg.slice(0, 3).toUpperCase();
+  }
+  function classOf(ev) {
+    if (ev === "rate_limit" || ev === "loop_detected") return "warn";
+    if (ev === "budget_exceeded" || ev === "request_denied" ||
+        ev === "domain_denied" || ev === "request_error") return "bad";
+    return "";
+  }
+
+  // ─── tab routing ──────────────────────────────────────────────────────
+  var tabs = $$("nav.tabs button[data-tab]");
+  var sections = {
+    credentials: $("#tab-credentials"),
+    activity:    $("#tab-activity"),
+    budgets:     $("#tab-budgets"),
+  };
+  var current = "credentials";
+  tabs.forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      current = btn.dataset.tab;
+      tabs.forEach(function (b) { b.classList.toggle("active", b === btn); });
+      Object.keys(sections).forEach(function (k) {
+        sections[k].hidden = (k !== current);
+      });
+    });
+  });
+
+  // ─── fetch helpers ────────────────────────────────────────────────────
+  function fetchJSON(url, opts) {
+    opts = opts || {};
+    return fetch(url, {
+      method: opts.method || "GET",
+      body: opts.body,
+      headers: Object.assign({ "accept": "application/json" }, opts.headers || {}),
+      cache: "no-store",
+    }).then(function (r) {
+      return r.text().then(function (text) {
+        var data = null;
+        try { data = text ? JSON.parse(text) : null; } catch (_) { data = null; }
+        return { status: r.status, ok: r.ok, data: data, raw: text };
+      });
+    });
+  }
+  function postJSON(url, body) {
+    return fetchJSON(url, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+  }
+  function delJSON(url) {
+    return fetchJSON(url, { method: "DELETE" });
+  }
+
+  // ─── credentials ──────────────────────────────────────────────────────
+  function loadCredentials() {
+    return fetchJSON("/api/credentials").then(function (r) {
+      if (!r.ok) return [];
+      return r.data || [];
+    });
+  }
+  function renderCreds(list) {
+    var tb = $("#cred-tbody");
+    $("#cred-count").textContent = list.length ? "(" + list.length + ")" : "";
+    if (!list.length) {
+      tb.innerHTML = '<tr><td colspan="6" class="empty-state">' +
+        'no credentials stored' +
+        '<div class="hint">click + add credential, or run <code>wardn import dotenv .env</code></div>' +
+        '</td></tr>';
+      return;
+    }
+    tb.innerHTML = list.map(function (c) {
+      var agents = c.allowed_agents.length
+        ? c.allowed_agents.map(esc).join(", ")
+        : "*";
+      var domains = c.allowed_domains.length
+        ? c.allowed_domains.map(esc).join(", ")
+        : "*";
+      var flags = "";
+      if (c.has_rate_limit) flags += '<span class="pill">rate-limit</span>';
+      if (c.has_budget)     flags += '<span class="pill">budget</span>';
+      if (!flags)           flags = '<span class="muted">—</span>';
+      return "<tr>" +
+        '<td class="name">' + esc(c.name) + "</td>" +
+        '<td class="muted">' + esc(agents) + "</td>" +
+        '<td class="muted">' + esc(domains) + "</td>" +
+        '<td>' + flags + "</td>" +
+        '<td class="dim">' + esc(fmtAge(c.created_at)) + "</td>" +
+        '<td><div class="actions">' +
+          '<button data-act="rotate" data-name="' + esc(c.name) + '">rotate</button>' +
+          '<button class="danger" data-act="delete" data-name="' + esc(c.name) + '">delete</button>' +
+        '</div></td>' +
+      "</tr>";
+    }).join("");
+  }
+
+  // ─── activity ─────────────────────────────────────────────────────────
+  function loadAudit() {
+    return fetchJSON("/api/audit?limit=200").then(function (r) {
+      if (!r.ok) return [];
+      return r.data || [];
+    });
+  }
+  function renderAudit(events) {
+    var log = $("#log");
+    $("#audit-count").textContent = events.length ? "(" + events.length + ")" : "";
+    if (!events.length) {
+      log.innerHTML = '<span class="empty">no events yet — proxy some traffic to fill this</span>';
+      return;
+    }
+    var lines = events.map(function (e) {
+      var cls = classOf(e.event);
+      var st  = methodOf(e.event);
+      var stCls = cls === "bad" ? "bad" : (cls === "warn" ? "warn" : "ok");
+      var m = (e.method || "·").padEnd(5);
+      var dom = e.domain || "·";
+      var path = e.path || "";
+      var agent = e.agent || "anonymous";
+      var cred = e.credential || "·";
+      var cost = e.cost_usd != null ? fmtUsd(e.cost_usd) : "";
+      var status = e.status ? String(e.status) : st;
+      var rowCls = cls ? " " + cls : (e.status && e.status >= 400 ? " bad" : "");
+      return '<span class="row' + rowCls + '">' +
+        '<span class="ts">' + fmtTs(e.timestamp) + '</span> ' +
+        '<span class="st ' + stCls + '">' + status.padEnd(3) + '</span> ' +
+        '<span class="mtd">' + m + '</span>' +
+        '<span class="dom">' + esc(dom) + '</span> ' +
+        '<span class="pth">' + esc(path) + '</span>  ' +
+        '<span class="agn">' + esc(agent) + '</span>  ' +
+        '<span class="crd">' + esc(cred) + '</span>  ' +
+        '<span class="cst">' + esc(cost) + '</span>' +
+        "</span>";
+    });
+    log.innerHTML = lines.join("\n");
+  }
+
+  // ─── budgets ──────────────────────────────────────────────────────────
+  function loadBudgets() {
+    return fetchJSON("/api/budgets").then(function (r) {
+      if (!r.ok) return [];
+      return r.data || [];
+    });
+  }
+  function renderBudgets(list) {
+    var configured = list.filter(function (b) { return b.configured; });
+    $("#budget-count").textContent = configured.length ? "(" + configured.length + ")" : "";
+    var tb = $("#budget-tbody");
+    if (!configured.length) {
+      tb.innerHTML = '<tr><td colspan="6" class="empty-state">' +
+        'no budgets configured' +
+        '<div class="hint">set one with <code>wardn budget set OPENAI_KEY --usd 5</code></div>' +
+        '</td></tr>';
+      return;
+    }
+    tb.innerHTML = configured.map(function (b) {
+      var pct = b.max_usd ? Math.min(100, (b.spent_usd / b.max_usd) * 100) : 0;
+      var cls = pct > 80 ? "over-80" : (pct > 50 ? "over-50" : "");
+      return "<tr>" +
+        '<td class="name">' + esc(b.credential) + "</td>" +
+        '<td class="muted">' + fmtUsd(b.max_usd) + "</td>" +
+        '<td>' + fmtUsd(b.spent_usd) + "</td>" +
+        '<td><span class="progress"><i style="width:' + pct.toFixed(1) + '%" class="' + cls + '"></i></span>' +
+            '<span class="muted">' + fmtPct(b.spent_usd, b.max_usd) + '</span></td>' +
+        '<td class="muted">' + esc(b.window || "—") + "</td>" +
+        '<td class="muted">' + esc(b.mode || "—") + "</td>" +
+      "</tr>";
+    }).join("");
+  }
+
+  // ─── refresh loop ─────────────────────────────────────────────────────
+  function refresh() {
+    Promise.all([
+      loadCredentials().then(renderCreds),
+      loadAudit().then(renderAudit),
+      loadBudgets().then(renderBudgets),
+      fetchJSON("/api/summary").then(function (r) {
+        if (r.ok && r.data && r.data.daemon) {
+          $("#vault-path").textContent = r.data.daemon.vault_path || "ephemeral";
+        }
+      }),
+    ]).then(function () {
+      $("#conn").textContent = "";
+      $("#conn").className = "conn";
+    }).catch(function (e) {
+      $("#conn").textContent = " · disconnected (" + e.message + ")";
+      $("#conn").className = "conn warn";
+    });
+  }
+  refresh();
+  setInterval(refresh, 2000);
+
+  // ─── drawer (create / rotate) ─────────────────────────────────────────
+  var drawer    = $("#drawer");
+  var scrim     = $("#scrim");
+  var title     = $("#drawer-title");
+  var nameInput = $("#f-name");
+  var valInput  = $("#f-value");
+  var domInput  = $("#f-domains");
+  var overWarn  = $("#overwrite-warn");
+  var nameErr   = $("#f-name-err");
+  var valErr    = $("#f-value-err");
+  var formErr   = $("#form-err");
+  var formOk    = $("#form-ok");
+  var submitBtn = $("#submit-btn");
+  var rotating  = false;
+
+  function openDrawer(opts) {
+    rotating = !!opts.rotate;
+    title.textContent = opts.rotate ? "rotate credential" : "add credential";
+    nameInput.value = opts.name || "";
+    nameInput.readOnly = !!opts.rotate;
+    valInput.value = "";
+    domInput.value = "";
+    overWarn.hidden = true;
+    nameErr.hidden = true; nameErr.textContent = "";
+    valErr.hidden = true;  valErr.textContent = "";
+    formErr.hidden = true; formErr.textContent = "";
+    formOk.hidden = true;  formOk.textContent = "";
+    submitBtn.textContent = rotating ? "rotate" : "store";
+    drawer.classList.add("open");
+    drawer.setAttribute("aria-hidden", "false");
+    scrim.classList.add("open");
+    if (rotating) valInput.focus(); else nameInput.focus();
+    fetchJSON("/api/summary").then(function (r) {
+      if (r.ok && r.data && r.data.daemon && r.data.daemon.vault_path) {
+        $("#confirm-path").textContent = r.data.daemon.vault_path;
+      }
+    });
+  }
+  function closeDrawer() {
+    drawer.classList.remove("open");
+    drawer.setAttribute("aria-hidden", "true");
+    scrim.classList.remove("open");
+  }
+  $("#drawer-close").addEventListener("click", closeDrawer);
+  $("#cancel-btn").addEventListener("click", closeDrawer);
+  scrim.addEventListener("click", closeDrawer);
+  document.addEventListener("keydown", function (e) {
+    if (e.key === "Escape" && drawer.classList.contains("open")) closeDrawer();
+  });
+
+  $("#add-btn").addEventListener("click", function () { openDrawer({}); });
+
+  // Reveal / hide toggle
+  var revealBtn = $("#reveal");
+  revealBtn.addEventListener("click", function () {
+    if (valInput.type === "password") {
+      valInput.type = "text"; revealBtn.textContent = "hide";
+    } else {
+      valInput.type = "password"; revealBtn.textContent = "show";
+    }
+    valInput.focus();
+  });
+  $("#paste-from-clip").addEventListener("click", function () {
+    if (navigator.clipboard && navigator.clipboard.readText) {
+      navigator.clipboard.readText().then(function (t) {
+        valInput.value = t;
+        valInput.type = "password";
+        revealBtn.textContent = "show";
+        valInput.focus();
+      });
+    } else {
+      valInput.focus();
+    }
+  });
+
+  // ─── name validation ──────────────────────────────────────────────────
+  var NAME_RX = /^[A-Za-z0-9_.\-@]+$/;
+  function validateNameClient(s) {
+    if (!s) return "name is required";
+    if (s.length > 128) return "name too long (max 128)";
+    if (!NAME_RX.test(s)) return "only letters, digits, _, -, ., @ allowed";
+    return null;
+  }
+  nameInput.addEventListener("input", function () {
+    var err = validateNameClient(nameInput.value);
+    if (err) {
+      nameErr.textContent = err;
+      nameErr.hidden = false;
+    } else {
+      nameErr.hidden = true;
+    }
+    // overwriting warning
+    if (!rotating && credList.some(function (c) { return c.name === nameInput.value; })) {
+      overWarn.textContent = "a credential with this name already exists — submitting will overwrite its value.";
+      overWarn.hidden = false;
+    } else {
+      overWarn.hidden = true;
+    }
+  });
+  valInput.addEventListener("input", function () {
+    valErr.hidden = true;
+  });
+
+  // Keep a local copy of creds for overwrite warning
+  var credList = [];
+  var _origRenderCreds = renderCreds;
+  renderCreds = function (list) {
+    credList = list;
+    _origRenderCreds(list);
+  };
+
+  // ─── form submit ──────────────────────────────────────────────────────
+  $("#cred-form").addEventListener("submit", function (e) {
+    e.preventDefault();
+    formErr.hidden = true; formOk.hidden = true;
+
+    var name = nameInput.value.trim();
+    var nameErrMsg = validateNameClient(name);
+    if (nameErrMsg) {
+      nameErr.textContent = nameErrMsg;
+      nameErr.hidden = false;
+      nameInput.focus();
+      return;
+    }
+    if (!valInput.value) {
+      valErr.textContent = "value is required";
+      valErr.hidden = false;
+      valInput.focus();
+      return;
+    }
+
+    submitBtn.disabled = true;
+
+    function done() {
+      submitBtn.disabled = false;
+    }
+    function fail(msg) {
+      formErr.textContent = msg;
+      formErr.hidden = false;
+      done();
+    }
+    function succeed(msg) {
+      formOk.textContent = msg;
+      formOk.hidden = false;
+      setTimeout(function () {
+        closeDrawer();
+        refresh();
+      }, 500);
+    }
+
+    if (rotating) {
+      postJSON("/api/credentials/" + encodeURIComponent(name) + "/rotate",
+               { value: valInput.value })
+        .then(function (r) {
+          if (r.ok) succeed("rotated · placeholders unchanged");
+          else fail((r.data && r.data.message) || ("rotate failed · HTTP " + r.status));
+        }).catch(function (e) { fail("network error · " + e.message); done(); });
+    } else {
+      var domains = domInput.value.split(",").map(function (s) { return s.trim(); }).filter(Boolean);
+      postJSON("/api/credentials", {
+        name: name,
+        value: valInput.value,
+        allowed_domains: domains,
+      })
+        .then(function (r) {
+          if (r.ok) {
+            var created = r.data && r.data.created;
+            succeed(created ? "stored · encrypted on disk" : "updated · value overwritten");
+          } else {
+            var msg = (r.data && r.data.message) || ("store failed · HTTP " + r.status);
+            fail(msg);
+          }
+        }).catch(function (e) { fail("network error · " + e.message); done(); });
+    }
+  });
+
+  // ─── row actions: rotate + delete (event delegation) ─────────────────
+  $("#cred-tbody").addEventListener("click", function (e) {
+    var btn = e.target.closest("button[data-act]");
+    if (!btn) return;
+    var name = btn.dataset.name;
+    if (btn.dataset.act === "rotate") {
+      openDrawer({ rotate: true, name: name });
+    } else if (btn.dataset.act === "delete") {
+      askDelete(name);
+    }
+  });
+
+  // ─── delete confirm (native <dialog>) ────────────────────────────────
+  var dialog       = $("#del-dialog");
+  var delInput     = $("#del-input");
+  var delName1     = $("#del-name");
+  var delName2     = $("#del-name-2");
+  var delHead      = $("#del-head");
+  var delConfirm   = $("#del-confirm");
+
+  function askDelete(name) {
+    delHead.textContent = "delete credential";
+    delName1.textContent = name;
+    delName2.textContent = name;
+    delInput.value = "";
+    delConfirm.disabled = true;
+    if (typeof dialog.showModal === "function") dialog.showModal();
+    else dialog.setAttribute("open", "");
+    setTimeout(function () { delInput.focus(); }, 30);
+  }
+  delInput.addEventListener("input", function () {
+    var expected = delName1.textContent;
+    delConfirm.disabled = delInput.value !== expected;
+  });
+  delInput.addEventListener("keydown", function (e) {
+    if (e.key === "Enter" && !delConfirm.disabled) delConfirm.click();
+  });
+  $("#del-cancel").addEventListener("click", function () {
+    if (dialog.open) dialog.close();
+  });
+  delConfirm.addEventListener("click", function () {
+    var name = delName1.textContent;
+    delConfirm.disabled = true;
+    delJSON("/api/credentials/" + encodeURIComponent(name))
+      .then(function (r) {
+        if (dialog.open) dialog.close();
+        if (r.ok) refresh();
+        else {
+          var msg = (r.data && r.data.message) || ("delete failed · HTTP " + r.status);
+          alert(msg);
+        }
+      })
+      .catch(function (e) {
+        alert("network error · " + e.message);
+      });
+  });
+
+  // Close dialog on Escape (native behavior) — but also clear field on close
+  dialog.addEventListener("close", function () {
+    delInput.value = "";
+  });
+})();
+</script>
+</body>
+</html>

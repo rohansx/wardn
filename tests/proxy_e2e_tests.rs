@@ -8,6 +8,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -17,6 +18,7 @@ use wiremock::matchers::{body_string_contains, header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use wardn::config::{CredentialConfig, WardenConfig};
+use wardn::proxy::audit::AuditLog;
 use wardn::proxy::budget::BudgetTracker;
 use wardn::proxy::loop_guard::LoopGuard;
 use wardn::proxy::rate_limit::RateLimiter;
@@ -71,7 +73,11 @@ async fn state_with_upstream(
         rate_limiter: Arc::new(tokio::sync::Mutex::new(RateLimiter::new())),
         budget_tracker: Arc::new(tokio::sync::Mutex::new(BudgetTracker::new())),
         loop_guard: Arc::new(tokio::sync::Mutex::new(LoopGuard::default())),
+        audit: Arc::new(std::sync::Mutex::new(AuditLog::new())),
         config,
+        host: "127.0.0.1".to_string(),
+        port: 7777,
+        started_at: Instant::now(),
         http_client: reqwest::Client::new(),
     });
 
@@ -609,7 +615,11 @@ async fn test_e2e_oauth_token_refreshed_before_injection() {
         rate_limiter: Arc::new(tokio::sync::Mutex::new(RateLimiter::new())),
         budget_tracker: Arc::new(tokio::sync::Mutex::new(BudgetTracker::new())),
         loop_guard: Arc::new(tokio::sync::Mutex::new(LoopGuard::default())),
+        audit: Arc::new(std::sync::Mutex::new(AuditLog::new())),
         config,
+        host: "127.0.0.1".to_string(),
+        port: 7777,
+        started_at: Instant::now(),
         http_client: reqwest::Client::new(),
     });
 

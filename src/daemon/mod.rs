@@ -1,10 +1,12 @@
 use std::sync::Arc;
+use std::time::Instant;
 
 use axum::Router;
 use tokio::sync::{Mutex, RwLock};
 
 use crate::config::WardenConfig;
 use crate::mcp::WardenMcpServer;
+use crate::proxy::audit::AuditLog;
 use crate::proxy::budget::BudgetTracker;
 use crate::proxy::loop_guard::LoopGuard;
 use crate::proxy::rate_limit::RateLimiter;
@@ -34,7 +36,9 @@ pub struct Daemon {
     rate_limiter: Arc<Mutex<RateLimiter>>,
     budget_tracker: Arc<Mutex<BudgetTracker>>,
     loop_guard: Arc<Mutex<LoopGuard>>,
+    audit: Arc<std::sync::Mutex<AuditLog>>,
     config: DaemonConfig,
+    started_at: Instant,
 }
 
 impl Daemon {
@@ -60,7 +64,9 @@ impl Daemon {
             rate_limiter: Arc::new(Mutex::new(rate_limiter)),
             budget_tracker: Arc::new(Mutex::new(BudgetTracker::new())),
             loop_guard: Arc::new(Mutex::new(LoopGuard::default())),
+            audit: Arc::new(std::sync::Mutex::new(AuditLog::new())),
             config,
+            started_at: Instant::now(),
         }
     }
 
@@ -71,7 +77,11 @@ impl Daemon {
             rate_limiter: self.rate_limiter.clone(),
             budget_tracker: self.budget_tracker.clone(),
             loop_guard: self.loop_guard.clone(),
+            audit: self.audit.clone(),
             config: self.config.warden_config.clone(),
+            host: self.config.host.clone(),
+            port: self.config.port,
+            started_at: self.started_at,
             http_client: reqwest::Client::new(),
         });
         proxy::build_router(state)
