@@ -224,8 +224,35 @@ async fn handle_proxy_request(
         .map(|pq| pq.as_str().to_string())
         .unwrap_or_else(|| path.clone());
 
-    let route = route::resolve_route(&path_and_query, &host, &state.config.upstreams);
+    // The daemon listens on plain HTTP, so an origin-form request (the
+    // normal client shape) necessarily arrived over http; a client sending
+    // absolute-form URIs (real forward-proxy style) may carry an explicit
+    // scheme. Use it when present — never assume https, which made every
+    // http request to the proxy fail.
+    let scheme = req.uri().scheme_str().unwrap_or("http").to_string();
+
+    let route = route::resolve_route(&path_and_query, &host, &scheme, &state.config.upstreams);
     let domain = route.domain.clone();
+
+    // Refuse to forward to our own listen address. A base-URL override
+    // without a provider prefix (e.g. `ANTHROPIC_BASE_URL=http://127.0.0.1:7777`)
+    // resolves, via Host-header fallback, back to this daemon — forwarding
+    // would loop the request through the proxy until the loop guard trips.
+    if route.provider_slug.is_none()
+        && route::is_self_upstream(&route.upstream_base, &state.host, state.port)
+    {
+        tracing::warn!(
+            request_id = %request_id,
+            agent = %agent_id,
+            method = %method,
+            path = %path,
+            upstream = %route.upstream_base,
+            "refusing to forward to own listen address"
+        );
+        return Err(WardenError::SelfForward {
+            upstream: route.upstream_base.clone(),
+        });
+    }
 
     tracing::info!(
         request_id = %request_id,
