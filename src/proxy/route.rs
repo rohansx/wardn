@@ -31,10 +31,13 @@ pub struct RouteTarget {
 ///    can't be used to pick a destination.
 /// 2. **Host-header routing** — fallback for explicit forward-proxy usage
 ///    (e.g. `/etc/hosts` pinning + a client that sends the real API's
-///    `Host` header). Preserves the original wardn behavior.
+///    `Host` header). The upstream is reached with the same scheme the
+///    client used — the daemon only speaks plain HTTP, so assuming `https`
+///    (as old versions did) made every http request fail.
 pub fn resolve_route(
     path_and_query: &str,
     host_header: &str,
+    scheme: &str,
     upstreams: &HashMap<String, String>,
 ) -> RouteTarget {
     if let Some(target) = resolve_provider_prefix(path_and_query, upstreams) {
@@ -48,10 +51,45 @@ pub fn resolve_route(
         .to_string();
 
     RouteTarget {
-        upstream_base: format!("https://{domain}"),
+        // Preserve the port from the Host header — dropping it would
+        // silently send the request to the scheme-default port (80/443)
+        // instead of the port the client actually used.
+        upstream_base: format!("{scheme}://{host_header}"),
         domain,
         upstream_path_and_query: path_and_query.to_string(),
         provider_slug: None,
+    }
+}
+
+/// True if `upstream_base` resolves to the daemon's own listen address.
+/// Forwarding there would send the request straight back into this proxy —
+/// a tight loop, only stopped much later by the loop guard. Only
+/// Host-header fallback routing can hit this; provider-prefixed routes go
+/// to configured upstreams.
+pub fn is_self_upstream(upstream_base: &str, own_host: &str, own_port: u16) -> bool {
+    let Ok(url) = url::Url::parse(upstream_base) else {
+        return false;
+    };
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    if url.port().unwrap_or(80) != own_port {
+        return false;
+    }
+
+    fn is_loopback(h: &str) -> bool {
+        matches!(h, "127.0.0.1" | "::1" | "localhost")
+    }
+
+    let own = own_host.trim_start_matches('[').trim_end_matches(']');
+    if own == "0.0.0.0" || own == "::" {
+        // Bound to every interface — any host on our port is us.
+        return true;
+    }
+    if is_loopback(own) {
+        is_loopback(host)
+    } else {
+        host == own
     }
 }
 
@@ -106,7 +144,7 @@ mod tests {
 
     #[test]
     fn test_provider_prefix_routes_to_configured_upstream() {
-        let target = resolve_route("/anthropic/v1/messages", "127.0.0.1:7777", &upstreams());
+        let target = resolve_route("/anthropic/v1/messages", "127.0.0.1:7777", "http", &upstreams());
 
         assert_eq!(target.upstream_base, "https://api.anthropic.com");
         assert_eq!(target.domain, "api.anthropic.com");
@@ -116,14 +154,19 @@ mod tests {
 
     #[test]
     fn test_provider_prefix_preserves_query_string() {
-        let target = resolve_route("/openai/v1/models?limit=10", "127.0.0.1:7777", &upstreams());
+        let target = resolve_route(
+            "/openai/v1/models?limit=10",
+            "127.0.0.1:7777",
+            "http",
+            &upstreams(),
+        );
 
         assert_eq!(target.upstream_path_and_query, "/v1/models?limit=10");
     }
 
     #[test]
     fn test_provider_prefix_bare_slug_maps_to_root() {
-        let target = resolve_route("/anthropic", "127.0.0.1:7777", &upstreams());
+        let target = resolve_route("/anthropic", "127.0.0.1:7777", "http", &upstreams());
         assert_eq!(target.upstream_path_and_query, "/");
     }
 
@@ -131,7 +174,7 @@ mod tests {
     fn test_unknown_prefix_falls_back_to_host_routing() {
         // "unknown" isn't a configured upstream slug, so this must NOT be
         // treated as a provider prefix — it falls back to Host routing.
-        let target = resolve_route("/unknown/v1/whatever", "api.example.com", &upstreams());
+        let target = resolve_route("/unknown/v1/whatever", "api.example.com", "https", &upstreams());
 
         assert_eq!(target.domain, "api.example.com");
         assert_eq!(target.upstream_base, "https://api.example.com");
@@ -141,12 +184,48 @@ mod tests {
 
     #[test]
     fn test_host_header_routing_when_no_prefix_matches() {
-        let target = resolve_route("/v1/chat/completions", "api.openai.com:443", &upstreams());
+        let target = resolve_route(
+            "/v1/chat/completions",
+            "api.openai.com:443",
+            "https",
+            &upstreams(),
+        );
 
         assert_eq!(target.domain, "api.openai.com");
-        assert_eq!(target.upstream_base, "https://api.openai.com");
+        assert_eq!(target.upstream_base, "https://api.openai.com:443");
         assert_eq!(target.upstream_path_and_query, "/v1/chat/completions");
         assert_eq!(target.provider_slug, None); // Host-header routing has no slug
+    }
+
+    #[test]
+    fn test_host_header_routing_uses_request_scheme() {
+        // The reported bug: a plain-http request must be forwarded over
+        // http, not assumed to be https.
+        let target = resolve_route("/anything", "127.0.0.1:7777", "http", &upstreams());
+
+        assert_eq!(target.upstream_base, "http://127.0.0.1:7777");
+        assert_eq!(target.domain, "127.0.0.1");
+        assert_eq!(target.upstream_path_and_query, "/anything");
+        assert_eq!(target.provider_slug, None);
+    }
+
+    #[test]
+    fn test_host_header_routing_preserves_port() {
+        let target = resolve_route("/v1/messages", "api.example.com:8080", "https", &upstreams());
+
+        assert_eq!(target.upstream_base, "https://api.example.com:8080");
+        assert_eq!(target.domain, "api.example.com");
+    }
+
+    #[test]
+    fn test_self_upstream_detection() {
+        assert!(is_self_upstream("http://127.0.0.1:7777/x", "127.0.0.1", 7777));
+        assert!(is_self_upstream("http://localhost:7777/x", "127.0.0.1", 7777));
+        assert!(is_self_upstream("http://127.0.0.1:7777/x", "0.0.0.0", 7777));
+        assert!(is_self_upstream("http://127.0.0.1:7777/x", "[::1]", 7777));
+        assert!(!is_self_upstream("http://127.0.0.1:9999/x", "127.0.0.1", 7777));
+        assert!(!is_self_upstream("http://api.example.com:7777/x", "127.0.0.1", 7777));
+        assert!(!is_self_upstream("not a url", "127.0.0.1", 7777));
     }
 
     #[test]
@@ -154,7 +233,7 @@ mod tests {
         // The exact bug this fixes: an SDK pointed at
         // http://127.0.0.1:7777/anthropic sends Host: 127.0.0.1:7777, which
         // must NOT resolve to the proxy itself.
-        let target = resolve_route("/anthropic/v1/messages", "127.0.0.1:7777", &upstreams());
+        let target = resolve_route("/anthropic/v1/messages", "127.0.0.1:7777", "http", &upstreams());
 
         assert_ne!(target.domain, "127.0.0.1");
         assert_eq!(target.domain, "api.anthropic.com");

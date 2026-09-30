@@ -714,3 +714,92 @@ async fn test_e2e_scrub_pattern_redacts_derived_secret_wardn_never_injected() {
     );
     assert!(body_str.contains("[REDACTED]"));
 }
+
+#[tokio::test]
+async fn test_e2e_host_header_fallback_uses_request_scheme() {
+    // Regression for https://github.com/rohansx/wardn/issues/3: host-header
+    // fallback routing hardcoded `https`, so any plain-http request to the
+    // proxy failed with "io error: error sending request for url
+    // (https://...)". The upstream must be reached over the same scheme the
+    // client used.
+    let mock_server = MockServer::start().await;
+    let (state, placeholder) = state_with_upstream(
+        &mock_server,
+        "unused-slug",
+        "OPENAI_KEY",
+        "sk-proj-real-key-123456",
+        "agent-1",
+    )
+    .await;
+
+    let upstream_host_port = mock_server.uri().strip_prefix("http://").unwrap().to_string();
+
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .and(header("authorization", "Bearer sk-proj-real-key-123456"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+        .mount(&mock_server)
+        .await;
+
+    // Origin-form URI (no scheme — as real curl/SDK clients send it), with
+    // the Host header naming the upstream. Must be forwarded over http.
+    let req = Request::builder()
+        .method("GET")
+        .uri("/v1/models")
+        .header("host", &upstream_host_port)
+        .header("x-warden-agent", "agent-1")
+        .header("authorization", format!("Bearer {placeholder}"))
+        .body(Body::empty())
+        .unwrap();
+
+    let resp = proxy::build_router(state).oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "http host-header request must reach the http upstream"
+    );
+
+    let received = mock_server.received_requests().await.unwrap();
+    assert_eq!(received.len(), 1);
+}
+
+#[tokio::test]
+async fn test_e2e_self_targeted_request_refused_without_loop() {
+    // A base-URL override without a provider prefix (e.g.
+    // `OPENAI_BASE_URL=http://127.0.0.1:7777/`) sends Host: 127.0.0.1:7777
+    // and would resolve back to the daemon itself. The proxy must refuse up
+    // front with a clear error instead of forwarding to itself and looping.
+    let mock_server = MockServer::start().await;
+    let (state, _placeholder) = state_with_upstream(
+        &mock_server,
+        "unused-slug",
+        "OPENAI_KEY",
+        "sk-proj-real-key-123456",
+        "agent-1",
+    )
+    .await;
+
+    let req = Request::builder()
+        .method("GET")
+        .uri("/anything")
+        .header("host", "127.0.0.1:7777") // state.host:state.port
+        .header("x-warden-agent", "agent-1")
+        .body(Body::empty())
+        .unwrap();
+
+    let resp = proxy::build_router(state).oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+
+    let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["error"], "proxy_error");
+    assert!(
+        json["message"]
+            .as_str()
+            .unwrap()
+            .contains("own listen address"),
+        "expected a self-forward refusal, got: {json}"
+    );
+}

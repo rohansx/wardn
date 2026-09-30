@@ -50,6 +50,9 @@ pub enum WardenError {
         repeat_count: usize,
     },
 
+    #[error("refusing to proxy request to {upstream} — that is wardn's own listen address; point the base URL at a provider prefix instead (e.g. http://127.0.0.1:7777/anthropic)")]
+    SelfForward { upstream: String },
+
     #[error("OAuth token refresh failed for '{credential}': {reason}")]
     OAuthRefreshFailed { credential: String, reason: String },
 
