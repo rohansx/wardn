@@ -270,7 +270,7 @@ mod tests {
             input_tokens: 1_000_000,
             output_tokens: 1_000_000,
         };
-        let cost = estimate_cost_usd("anthropic", "claude-sonnet-5", usage);
+        let cost = estimate_cost_usd("anthropic", "claude-sonnet-4-6", usage);
         assert!((cost - 18.0).abs() < 1e-9); // 3.0 input + 15.0 output per 1M
     }
 
